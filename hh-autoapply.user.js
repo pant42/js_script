@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HH.ru AutoApply
 // @namespace    http://tampermonkey.net/
-// @version      0.2.0
+// @version      0.3.0
 // @description  Автоматический отклик на hh.ru с сопроводительным письмом. Поддерживает ручной (Next) и авто-режим.
 // @author       You
 // @match        https://*.hh.ru/*
@@ -15,15 +15,25 @@
     'use strict';
 
     // ============================================================
+    //  ИДЕНТИФИКАЦИЯ ТЕКУЩЕЙ СЕССИИ (ПРОГОНА)
+    // ============================================================
+    let currentSessionId = sessionStorage.getItem('hh_autoapply_session_id');
+    if (!currentSessionId) {
+        currentSessionId = Date.now().toString();
+        sessionStorage.setItem('hh_autoapply_session_id', currentSessionId);
+    }
+
+    // ============================================================
     //  КОНФИГУРАЦИЯ
     // ============================================================
+    const savedConfig = GM_getValue('hh_autoapply_config', {});
     const CONFIG = {
         // Шаблон сопроводительного письма.
         coverLetterTemplate: `Здравствуйте.
 Меня заинтересовала ваша вакансия.
 У меня более 6 лет опыта в тестировании веб- и backend-приложений. Работал с функциональным, регрессионным и API-тестированием, анализом требований, локализацией дефектов и сопровождением релизов.
-Использую в работе SQL, Postman, REST API, Jira, Git. Также участвовал во внедрении автотестов на Playwright и автоматизации отдельных QA-процессов.
-Основной фокус в работе — поиск критичных сценариев и снижение рисков до релиза, а не только формальное прохождение тест-кейсов. Есть опыт взаимодействия с разработчиками, аналитиками и product-командой при проработке требований и проверке новых фич.
+Использую в работе SQL, Postman, REST API, Jira, Git. Также участвовал во внедрении автотестов на Playwright и автоматизации отдельных QA процессов.
+Основной фокус в работе- поиск критичных сценариев и снижение рисков до релиза, а не только формальное прохождение тест-кейсов. Есть опыт взаимодействия с разработчиками, аналитиками и product командой при проработке требований и проверке новых фич.
 Буду рад обсудить, как мой опыт может быть полезен вашей команде.
 С уважением,
 Александр Пантин
@@ -32,9 +42,32 @@ Email: pantin_42@inbox.ru`,
         // Задержка перед кликом (мс)
         clickDelay: 300,
         // URL поиска вакансий для возврата при редиректе на страницу отклика (questions)
-        searchRedirectUrl: "https://tver.hh.ru/search/vacancy?resume=3340516fff092acd5b0039ed1f737448347a6b&text=&excluded_text=&area=113&salary=&salary=&currency_code=RUR&experience=doesNotMatter&order_by=relevance&search_period=0&items_on_page=100&L_save_area=true&hhtmFrom=vacancy_search_filter",
+        searchRedirectUrl: savedConfig.searchRedirectUrl || "https://tver.hh.ru/search/vacancy?area=113&ored_clusters=true&text=QA+Engineer+%28Manual+%2B+Automation%29&items_on_page=100&search_session_id=c9efa11b-53d2-4327-bba5-2cfb1c5d521c",
         // Дневной лимит откликов
-        dailyLimit: 150,
+        dailyLimit: savedConfig.dailyLimit || 150,
+    };
+
+    function saveConfig() {
+        GM_setValue('hh_autoapply_config', {
+            searchRedirectUrl: CONFIG.searchRedirectUrl,
+            dailyLimit: CONFIG.dailyLimit
+        });
+    }
+
+    // ============================================================
+    //  ИМЕНОВАННЫЕ ЗАДЕРЖКИ (мс)
+    // ============================================================
+    const DELAYS = {
+        short: 100,
+        click: 300,
+        small: 500,
+        wait: 1000,
+        animation: 1500,
+        step: 2000,
+        retryFirst: 3000,
+        retryNext: 7000,
+        pause: 10000,
+        longWait: 20000,
     };
 
     // ============================================================
@@ -44,6 +77,7 @@ Email: pantin_42@inbox.ru`,
         // --- Страница поиска вакансий ---
         vacancyCard: '[data-qa="vacancy-serp__vacancy"]',
         vacancyTitle: '[data-qa="serp-item__title"]',
+        companyName: '[data-qa="vacancy-serp__vacancy-employer"]',
         vacancyTitleLink: 'a[data-qa="serp-item__title"]',
         applyButton: '[data-qa="vacancy-serp__vacancy_response"]',
 
@@ -53,12 +87,17 @@ Email: pantin_42@inbox.ru`,
         responseModalClose: '[data-qa="response-popup-close"]',
         // Основное поле в popup
         coverLetterInput: '[data-qa="vacancy-response-popup-form-letter-input"]',
+        // Кнопка "Добавить сопроводительное" в окне с предупреждением
+        addCoverLetterBtn: '[data-qa="add-cover-letter"]',
         // Альтернативные селекторы для inline-формы, появляющейся после клика "Приложить письмо"
         coverLetterInputAlt: 'form[id^="cover-letter-"] textarea[name="text"], [data-qa="textarea-native-wrapper"] textarea, textarea[name="text"]',
         // Кнопки отправки: popup и inline-форма
         submitButton: '[data-qa="vacancy-response-submit-popup"], [data-qa="vacancy-response-letter-submit"]',
         generateCoverLetterBtn: '[data-qa="generate-cover-letter"]',
         coverLetterToggle: '[data-qa="vacancy-response-letter-toggle"], [data-qa="vacancy-response-letter-toggle-text"]',
+
+        // --- Модалка предупреждения о другой стране ---
+        relocationConfirmBtn: '[data-qa="relocation-warning-confirm"]',
 
         // --- Страница вопросов (вместо модалки — полный редирект) ---
         employerAskingForTest: '[data-qa="employer-asking-for-test"]',
@@ -74,6 +113,27 @@ Email: pantin_42@inbox.ru`,
         // --- Общие ---
         coverLetterRequired: 'Сопроводительное письмо обязательное',
         resumeTitle: '[data-qa="resume-title"]',
+
+        // --- Маркер отклика на карточке поиска ---
+        respondedMarker: '[data-qa="vacancy-serp__vacancy_responded"]',
+        // --- Модалка предупреждения об отказе ---
+        responseRejectWarning: '[data-qa="response-reject-warning"]',
+        // --- Заголовок/описание на странице отклика ---
+        titleDescription: '[data-qa="title-description"]',
+
+        // --- Страница отклика: извлечение названия вакансии и компании (ХРУПКО) ---
+        responseCredsTitle: '[data-qa="vacancy-credentials"] [data-qa="cell-text-content"]',
+        responseMainTitle: 'h1[data-qa="title"]',
+        responseSidebarColumn: '.magritte-grid-column_m-4___-vMK7_3-0-3',
+        responseCompanyAvatar: '[aria-label][class*="magritte-avatar"]',
+
+        // --- Страница вакансии: кнопки отклика ---
+        vacancyApplyTop: '[data-qa="vacancy-response-link-top"]',
+        vacancyApplyBottom: '[data-qa="vacancy-response-link-bottom"]',
+        anyResponseButton: 'button[data-qa*="response"]',
+
+        // --- Отказы (чаты): бейдж непрочитанных ---
+        chatUnreadBadge: '[data-qa="chatik-info-badges"]',
     };
 
     // ============================================================
@@ -82,27 +142,42 @@ Email: pantin_42@inbox.ru`,
     const STATE = {
         stepIndex: 0,
         steps: [],
-        vacancies: [],
-        currentVacancyIndex: 0,
+        vacancies: [], // Не сохраняется между полными перезагрузками, только для сессии
+        currentVacancyIndex: 0, // Сбрасывается при перезагрузке
         outlineLinks: [],     // вакансии, требующие ручной обработки
+        unclearOutlineLinks: [], // Вакансии, где произошла непонятная ошибка
         // URL вакансий, которые требуют ответов/аутлайн и должны быть пропущены
         skippedVacancyUrls: [],
-        appliedCount: 0,
-        skippedCount: 0,
         isRunning: false,
         returnedFromOutline: false,  // флаг: вернулись ли с страницы вопросов
         retryDelay: 0,              // 0 - первый сбор, 3000 - второй, 7000 - третий и далее
+        emptyPageRetries: 0,        // счетчик пустых страниц подряд
+        emptyPageRestarts: 0,       // счетчик 10-секундных перезапусков,
+        appliedCount: 0, // Счетчик откликов
+        skippedCount: 0, // Счетчик пропущенных
     };
+
+    const REJECT_STATE = {
+        processedNodes: new Set(),
+        isRunning: false
+    };
+    let autoRejectInterval = null;
 
     function saveState() {
         GM_setValue('hh_autoapply_state', {
             outlineLinks: STATE.outlineLinks,
-            appliedCount: STATE.appliedCount,
-            skippedCount: STATE.skippedCount,
+            unclearOutlineLinks: STATE.unclearOutlineLinks,
             skippedVacancyUrls: STATE.skippedVacancyUrls,
             returnedFromOutline: STATE.returnedFromOutline,
             isRunning: STATE.isRunning,
-            retryDelay: STATE.retryDelay
+            retryDelay: STATE.retryDelay,
+            emptyPageRetries: STATE.emptyPageRetries,
+            emptyPageRestarts: STATE.emptyPageRestarts,
+            vacancies: STATE.vacancies.map(v => ({ title: v.title, link: v.link, company: v.company, })),
+            currentVacancyIndex: STATE.currentVacancyIndex,
+            // Сохраняем счетчики
+            appliedCount: STATE.appliedCount,
+            skippedCount: STATE.skippedCount,
         });
     }
 
@@ -167,16 +242,41 @@ Email: pantin_42@inbox.ru`,
         return Array.from(parent.querySelectorAll(selector));
     }
 
+    // Пробует селекторы по порядку (fallback-цепочка), возвращает { el, selector } или null.
+    function firstMatch(selectors, parent = document) {
+        for (const s of selectors) {
+            const el = parent.querySelector(s);
+            if (el) return { el, selector: s };
+        }
+        return null;
+    }
+
     function isAlreadyResponded(card) {
         if (!card) return false;
         // Ищем явный маркер отклика
-        if (card.querySelector('[data-qa="vacancy-serp__vacancy_responded"]')) return true;
+        if (card.querySelector(SELECTORS.respondedMarker)) return true;
         // Или текстовый маркер внутри карточки
         try {
             // Очищаем от неразрывных пробелов (&nbsp; -> \u00A0)
             const txt = (card.textContent || '').replace(/\u00A0/g, ' ').trim();
             if (txt.includes('Вы откликнулись')) return true;
         } catch (e) {}
+        return false;
+    }
+
+    // Быстрая проверка на появление окна "отклик в другую страну"
+    async function checkAndHandleRelocationWarning() {
+        for (let i = 0; i < 5; i++) {
+            await wait(400);
+            const relocationBtn = qs(SELECTORS.relocationConfirmBtn);
+            if (relocationBtn) {
+                log('Обнаружено окно "отклик в другую страну". Подтверждаю...', 'warn');
+                relocationBtn.click();
+                await wait(DELAYS.wait); // ждем реакцию после клика
+                return true;
+            }
+            if (qs(SELECTORS.responseModal)) return false; // если уже появилась стандартная модалка
+        }
         return false;
     }
 
@@ -215,20 +315,20 @@ Email: pantin_42@inbox.ru`,
 
     // Находит textarea для письма: если есть кнопка "Приложить письмо" — кликает, иначе ищет напрямую
     async function ensureCoverLetterFieldVisible() {
-        const toggle = qs(SELECTORS.coverLetterToggle);
+        const toggle = qs(SELECTORS.coverLetterToggle) || qs(SELECTORS.addCoverLetterBtn);
         if (toggle) {
             log('Нажимаю кнопку "Приложить письмо"...', 'step');
             const clickTarget = toggle.closest('button, [role="button"], label') || toggle;
             clickTarget.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
-            await wait(100);
+            await wait(DELAYS.short);
             clickTarget.click();
             // Ждём появления и завершения анимации textarea (выезжает сверху)
-            await wait(1500);
+            await wait(DELAYS.animation);
             let textarea = getCoverLetterField();
             if (textarea) return textarea;
             log('После клика поле письма не найдено, пробую ещё раз...', 'warn');
             clickTarget.click();
-            await wait(1500);
+            await wait(DELAYS.animation);
             textarea = getCoverLetterField();
             if (textarea) return textarea;
         } else {
@@ -237,145 +337,313 @@ Email: pantin_42@inbox.ru`,
         return getCoverLetterField();
     }
 
-    // Сценарий 2: модальное окно с обязательным письмом (textarea видна сразу)
-    async function handleModalForCoverLetterOnSearchPage(vacancy) {
-        log('Обработка модального окна письма на странице поиска...', 'step');
-        
-        // Ищем textarea
-        const textarea = getCoverLetterField();
-        if (!textarea) {
-            log('Textarea для письма не найдена', 'warn');
-            return false;
-        }
+    // ============================================================
+    //  ЕДИНЫЙ ПАЙПЛАЙН ОТКЛИКА
+    //  После клика "Откликнуться" определяем исход:
+    //    1) аутлайн (вопросы работодателя)  -> сценарий 3
+    //    2) модалка отклика                 -> сценарий 2
+    //    3) поле/кнопка письма на странице  -> сценарий 1
+    //  В остальных случаях: приложить письмо -> "Отправить"
+    // ============================================================
+    const OUTLINE_MARKER_FULL = 'Для отклика необходимо ответить на несколько вопросов';
+    const OUTLINE_MARKER_SHORT = 'ответить на несколько вопросов';
 
-        // Заполняем письмо
-        fillTextarea(textarea);
-        log('Письмо заполнено', 'success');
-
-        // Ждём пока кнопка появится и станет активной (до 3 сек)
-        let applyBtn = null;
-        for (let i = 0; i < 15; i++) {
-            await wait(200);
-            applyBtn = qs(SELECTORS.submitButton);
-            if (!applyBtn) {
-                const btns = qsa('button, [role="button"]');
-                applyBtn = btns.find(b => (b.textContent || '').trim().includes('Откликнуться'));
-            }
-            if (applyBtn && !applyBtn.disabled) {
-                break;
-            }
-        }
-
-        if (!applyBtn) {
-            log('Кнопка "Откликнуться" не найдена в модальном окне', 'warn');
-            return false;
-        }
-        if (applyBtn.disabled) {
-            log('Кнопка "Откликнуться" найдена, но неактивна (disabled)', 'warn');
-            return false;
-        }
-
-        // Кликаем кнопку
-        try {
-            applyBtn.scrollIntoView({ block: 'center', inline: 'center' });
-            await wait(100);
-            applyBtn.click();
-            log('Нажата кнопка "Откликнуться" в модальном окне', 'step');
-        } catch (e) { 
-            log('Ошибка клика по кнопке: ' + e.message, 'error');
-            return false;
-        }
-
-        // Ждём результата: либо карточка обновится, либо редирект
-        for (let i = 0; i < 12; i++) {
-            await wait(500);
-
-            // Проверяем редирект на страницу вопросов
-            if (detectPageType() === 'response') {
-                log('После отклика произошёл редирект на страницу вопросов. Сохраняю в аутлайн и возвращаюсь на поиск.', 'warn');
-                addToOutline(vacancy.title, vacancy.link || window.location.href);
-                STATE.returnedFromOutline = true;
-                saveState();
-                redirectSearch();
-                return false;
-            }
-
-            // Проверяем, исчезло ли модальное окно (модалка закрылась - отклик отправлен)
-            const stillHasTextarea = getCoverLetterField();
-            if (!stillHasTextarea) {
-                log('Модальное окно закрылось - отклик отправлен', 'success');
-                return true;
-            }
-        }
-
-        log('Не удалось определить результат отклика, но письмо было отправлено', 'warn');
-        return true;
+    function normText(value) {
+        return (value || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
     }
 
-    // Сценарий 1: inline-карточка с кнопкой "Приложить письмо" (письмо необязательно)
-    async function handleInlineCoverLetterCard(vacancy) {
-        const textarea = await ensureCoverLetterFieldVisible();
-        if (!textarea) {
-            log('Не удалось открыть поле для сопроводительного письма.', 'warn');
-            return false;
-        }
+    // Сценарий 3: на странице вопросы работодателя (аутлайн)
+    function isOutlineDetected() {
+        const modal = qs(SELECTORS.responseModal);
+        if (modal && normText(modal.textContent).includes(OUTLINE_MARKER_SHORT)) return true;
+        if ((qs(SELECTORS.employerAskingForTest) || qs(SELECTORS.taskBody)) && !modal) return true;
+        const titleDesc = qs(SELECTORS.titleDescription);
+        if (titleDesc && normText(titleDesc.textContent).includes(OUTLINE_MARKER_SHORT)) return true;
+        if (detectPageType() === 'response' && normText(getPageText()).includes(OUTLINE_MARKER_SHORT)) return true;
+        if (normText(document.body.textContent).includes(OUTLINE_MARKER_FULL)) return true;
+        return false;
+    }
 
-        fillTextarea(textarea);
-        log('Сопроводительное письмо вставлено в inline-карточку.', 'success');
-        await wait(300);
+    // Есть ли куда приложить сопроводительное письмо (поле или кнопка "Приложить письмо")
+    function hasLetterPlace() {
+        return !!(getCoverLetterField() || qs(SELECTORS.coverLetterToggle) || qs(SELECTORS.addCoverLetterBtn));
+    }
 
-        // Попробуем найти кнопку отклика в карточке: сначала по известным селекторам, затем по тексту 'Откликнуться'
-        let applyBtn = null;
-        try {
-            applyBtn = qs(SELECTORS.submitButton, vacancy.card) || qs(SELECTORS.applyButton, vacancy.card) || qs(SELECTORS.applyButton);
-            if (!applyBtn) {
-                // Ищем span с текстом или magritte label
-                const labels = vacancy.card ? Array.from(vacancy.card.querySelectorAll('span')) : [];
-                for (const l of labels) {
-                    const txt = (l.textContent || '').trim();
-                    if (txt === 'Откликнуться' || txt.includes('Откликнуться')) {
-                        applyBtn = l.closest('button') || l.parentElement;
-                        break;
+    // Кнопка/span с точным текстом (в т.ч. magritte-label)
+    function findButtonByText(root, text, excludeApply) {
+        const isApply = (el) => excludeApply && el.matches(SELECTORS.applyButton);
+        const nodes = qsa('button, [role="button"], a', root);
+        let el = nodes.find(node => !isApply(node) && normText(node.textContent) === text);
+        if (el) return el;
+        const labels = qsa('span', root).filter(span =>
+            !span.children.length &&
+            normText(span.textContent) === text &&
+            !(excludeApply && span.closest(SELECTORS.applyButton))
+        );
+        if (labels.length) return labels[0].closest('button, [role="button"]') || labels[0];
+        return nodes.find(node => !isApply(node) && normText(node.textContent).includes(text)) || null;
+    }
+
+    // Кнопка отправки: "Отправить" (любой вариант кнопки) или "Откликнуться"
+    async function findSubmitButton(scopeEl, timeoutMs = 4000) {
+        const start = Date.now();
+        do {
+            const modal = qs(SELECTORS.responseModal);
+            const scopes = [];
+            if (modal) scopes.push(modal);
+            if (scopeEl && scopeEl !== modal) scopes.push(scopeEl);
+            scopes.push(document.body);
+
+            for (const scope of scopes) {
+                const byQa = qs(SELECTORS.submitButton, scope);
+                if (byQa) return byQa;
+            }
+            for (const scope of scopes) {
+                const bySend = findButtonByText(scope, 'Отправить', false);
+                if (bySend) return bySend;
+            }
+            for (const scope of scopes) {
+                const byApply = findButtonByText(scope, 'Откликнуться', true);
+                if (byApply) return byApply;
+            }
+            if (Date.now() - start >= timeoutMs) break;
+            await wait(200);
+        } while (true);
+        return null;
+    }
+
+    // Какой исход появился после клика "Откликнуться"
+    function detectApplyOutcome(vacancy) {
+        if (isOutlineDetected()) return 'outline';
+        if (qs(SELECTORS.responseModal)) return 'modal';
+        if (detectPageType() === 'response') return isAlreadyRespondedOnPage() ? 'responded' : 'response';
+        if (hasLetterPlace()) return 'letter';
+        if (vacancy && vacancy.card && isAlreadyResponded(vacancy.card)) return 'responded';
+        return null;
+    }
+
+    // Сколько ждать редирект на вопросы при «зарегистрированном» отклике (гибрид сценариев 1↔3)
+    const HYBRID_GRACE_MS = 2500;
+
+    // Ждём исхода клика (два одинаковых результата подряд = подтверждён)
+    async function waitForApplyOutcome(vacancy, timeoutMs = 8000) {
+        const start = Date.now();
+        let previous = null;
+        while (Date.now() - start < timeoutMs) {
+            const outcome = detectApplyOutcome(vacancy);
+            if (outcome === 'outline') return 'outline';
+            if (outcome && outcome === previous) {
+                if (outcome === 'responded') {
+                    // «Отклик зарегистрирован», но может последовать переадресация
+                    // на вопросы работодателя — ждём её, чтобы не засчитать дважды
+                    // (сначала как применённую, затем как вакансию в аутлайне).
+                    const graceEnd = Date.now() + HYBRID_GRACE_MS;
+                    while (Date.now() < graceEnd) {
+                        await wait(DELAYS.short);
+                        if (isOutlineDetected()) return 'outline';
+                        if (detectPageType() === 'response') {
+                            // На странице отклика ждём рендер: если появятся вопросы —
+                            // это аутлайн, иначе отклик успешен.
+                            while (Date.now() < graceEnd) {
+                                await wait(DELAYS.short);
+                                const current = detectApplyOutcome(vacancy);
+                                if (current === 'outline') return 'outline';
+                                if (current && current !== 'none') return current;
+                            }
+                        }
                     }
                 }
+                return outcome;
             }
-        } catch (e) { log('Ошибка при поиске кнопки отклика: ' + e.message, 'error'); }
+            previous = outcome;
+            await wait(300);
+        }
+        return 'none';
+    }
 
-        if (!applyBtn) {
-            log('Кнопка "Откликнуться" не найдена в карточке. Оставляю заполненным и помечаю для ручной проверки.', 'warn');
-            return false;
+    // Единое действие: приложить письмо -> нажать "Отправить" -> подтвердить
+    async function attachLetterAndSubmit(vacancy) {
+        if (isOutlineDetected()) {
+            await handleOutlineOutcome(vacancy);
+            return 'outline';
         }
 
-        // Кликаем кнопку отклика
+        // 1. Ищем, куда приложить сопроводительное письмо
+        let textarea = getCoverLetterField();
+        if (!textarea) textarea = await ensureCoverLetterFieldVisible();
+        if (!textarea) {
+            // Поле могло появиться с задержкой
+            for (let i = 0; i < 8 && !textarea; i++) {
+                await wait(250);
+                textarea = getCoverLetterField();
+            }
+        }
+
+        if (textarea) {
+            fillTextarea(textarea);
+            log('Сопроводительное письмо вставлено', 'success');
+            await wait(DELAYS.small);
+        } else {
+            log('Поле для сопроводительного письма не найдено — отправляю без письма', 'warn');
+        }
+
+        // Вопросы могли проявиться, пока заполняли письмо
+        if (isOutlineDetected()) {
+            await handleOutlineOutcome(vacancy);
+            return 'outline';
+        }
+
+        // 2. Ищем кнопку "Отправить"
+        const submitBtn = await findSubmitButton(vacancy ? vacancy.card : null, 4000);
+        if (!submitBtn) {
+            log('Кнопка "Отправить" не найдена', 'warn');
+            return 'failed';
+        }
+        const realBtn = submitBtn.closest ? (submitBtn.closest('button') || submitBtn) : submitBtn;
+        if (submitBtn.disabled || realBtn.disabled) {
+            log('Кнопка "Отправить" неактивна. Возможно нужно выбрать резюме.', 'warn');
+            setStepDesc('Кнопка "Отправить" неактивна. Выберите резюме вручную, затем нажмите Next.');
+            return 'disabled';
+        }
+
+        // 3. Жмём "Отправить"
+        const startPageType = detectPageType();
+        const hadModal = !!qs(SELECTORS.responseModal);
         try {
-            applyBtn.scrollIntoView({ block: 'center', inline: 'center' });
-            await wait(100);
-            applyBtn.click();
-            log('Нажата кнопка "Откликнуться"', 'step');
-        } catch (e) { log('Не удалось кликнуть кнопку отклика: ' + e.message, 'error'); }
-
-        // Ждём результата: либо карточка сменит состояние на "Вы откликнулись", либо будет редирект на страницу отклика (questions)
-        for (let i = 0; i < 12; i++) {
-            await wait(500);
-            // Редирект на страницу отклика
-            if (detectPageType() === 'response') {
-                log('После клика произошёл редирект на страницу отклика (вопросы). Сохраняю в аутлайн и возвращаюсь на поиск.', 'warn');
-                addToOutline(vacancy.title, vacancy.link || window.location.href);
-                STATE.returnedFromOutline = true;
-                saveState();
-                redirectSearch();
-                return false;
-            }
-
-            // Проверяем, сменился ли статус карточки на отвеченный
-            if (isAlreadyResponded(vacancy.card)) {
-                registerSuccessfulApply(vacancy.title);
-                return true;
-            }
+            submitBtn.scrollIntoView({ block: 'center', inline: 'center' });
+            await wait(DELAYS.short);
+            submitBtn.click();
+            log('Нажата кнопка "Отправить"', 'step');
+        } catch (e) {
+            log('Ошибка клика по "Отправить": ' + e.message, 'error');
+            return 'failed';
         }
 
-        log('Не удалось обнаружить подтверждение отклика после нажатия. Проверьте вручную.', 'warn');
-        return false;
+        // 4. Ждём результат
+        return await waitForSubmitResult(vacancy, startPageType, hadModal, 8000);
+    }
+
+    // Ждём результат после нажатия "Отправить"
+    async function waitForSubmitResult(vacancy, startPageType, hadModal, timeoutMs) {
+        const start = Date.now();
+        let closedStreak = 0;
+        while (Date.now() - start < timeoutMs) {
+            // Вопросы работодателя -> аутлайн
+            if (isOutlineDetected()) {
+                await handleOutlineOutcome(vacancy);
+                return 'outline';
+            }
+            // Ушли на другую страницу (например, страницу отклика)
+            if (detectPageType() !== startPageType) return 'pending_response';
+            // Отклик подтверждён
+            if (isAlreadyRespondedOnPage()) return 'success';
+            if (vacancy && vacancy.card && isAlreadyResponded(vacancy.card)) return 'success';
+            // Форма закрылась — отклик отправлен
+            const formOpen = qs(SELECTORS.responseModal) || getCoverLetterField();
+            if (!formOpen && (hadModal || startPageType !== 'search')) {
+                closedStreak++;
+                if (closedStreak >= 2) return 'success';
+            } else {
+                closedStreak = 0;
+            }
+            await wait(300);
+        }
+        return 'unclear';
+    }
+
+    // Сценарий 3 (аутлайн): сохраняем вакансию для ручной обработки
+    async function handleOutlineOutcome(vacancy) {
+        const creds = extractVacancyTitleFromPage();
+        const title = (vacancy && vacancy.title) || creds.title;
+        const company = (vacancy && vacancy.company) || creds.company;
+        const link = (vacancy && vacancy.link) || window.location.href;
+
+        log(`Вопросы работодателя (аутлайн): "${title}"`, 'warn');
+        setStepDesc(`Аутлайн: "${title}" — вопросы работодателя.`);
+        await collectAndStoreQuestions();
+        addToOutline(title, link, company);
+        saveState();
+        updateStats();
+
+        if (detectPageType() === 'search') {
+            const closeBtn = qs(SELECTORS.responseModalClose);
+            if (closeBtn) closeBtn.click();
+            finishVacancy(vacancy, `Аутлайн сохранён: "${title}". Нажмите Next для следующей.`);
+            return;
+        }
+
+        STATE.returnedFromOutline = true;
+        saveState();
+        redirectSearch();
+    }
+
+    // Переход к следующей вакансии
+    function finishVacancy(vacancy, message) {
+        STATE.currentVacancyIndex++;
+        saveState();
+        updateStats();
+        setStepDesc(message || `Обработано ${STATE.currentVacancyIndex}/${STATE.vacancies.length}. Нажмите Next для следующей.`);
+    }
+
+    // Единый пайплайн: разбираем исход клика и доводим отклик до конца
+    async function runUnifiedApply(vacancy, outcome, depth = 0) {
+        log(`Исход отклика: ${outcome}`, 'info');
+
+        if (outcome === 'outline') {
+            await handleOutlineOutcome(vacancy);
+            return 'outline';
+        }
+
+        if (outcome === 'responded') {
+            log('Отклик уже отправлен', 'success');
+            if (registerSuccessfulApply(vacancy.title)) return 'stopped';
+            finishVacancy(vacancy, `Отклик уже отправлен: "${vacancy.title}". Нажмите Next для следующей.`);
+            return 'success';
+        }
+
+        if (outcome === 'none') {
+            log('После клика не появилось ни модалки, ни поля письма, ни вопросов. Пропускаю.', 'warn');
+            STATE.skippedCount++;
+            finishVacancy(vacancy, `Пропущено: "${vacancy.title}". Нажмите Next для следующей.`);
+            return 'skipped';
+        }
+
+        // 'modal' | 'letter' | 'response' → приложить письмо и "Отправить"
+        const result = await attachLetterAndSubmit(vacancy);
+
+        if (result === 'disabled') return 'disabled';
+        if (result === 'outline') return 'outline';
+
+        if (result === 'success') {
+            if (registerSuccessfulApply(vacancy.title)) return 'stopped';
+            finishVacancy(vacancy, `Отклик отправлен: "${vacancy.title}". Нажмите Next для следующей.`);
+            return 'success';
+        }
+
+        if (result === 'pending_response' && depth < 2) {
+            const creds = extractVacancyTitleFromPage();
+            const nextVacancy = {
+                title: (vacancy && vacancy.title) || creds.title,
+                company: (vacancy && vacancy.company) || creds.company,
+                link: (vacancy && vacancy.link) || window.location.href,
+                card: null,
+            };
+            return runUnifiedApply(nextVacancy, 'response', depth + 1);
+        }
+
+        if (result === 'unclear') {
+            log('Не удалось подтвердить отклик. Добавляю в "Непонятное".', 'warn');
+            addToUnclearOutline(vacancy.title, vacancy.link || window.location.href, vacancy.company);
+            saveState();
+            STATE.skippedCount++;
+            finishVacancy(vacancy, `Отклик не подтверждён: "${vacancy.title}" — в "Непонятное".`);
+            return 'unclear';
+        }
+
+        // 'failed'
+        STATE.skippedCount++;
+        finishVacancy(vacancy, `Не удалось отправить отклик: "${vacancy.title}".`);
+        return 'failed';
     }
 
     // Определяем тип текущей страницы
@@ -387,230 +655,278 @@ Email: pantin_42@inbox.ru`,
         return 'unknown';
     }
 
-    // Определяем тип отклика
-    function detectResponseType() {
-        // Есть вопросы работодателя? (full page /applicant/vacancy_response)
-        if (qs(SELECTORS.employerAskingForTest)) return 'outline';  // вопросы = аутлайн
-        if (qs(SELECTORS.testDescription) || qs(SELECTORS.taskBody)) return 'outline';
-
-        const titleDesc = qs('[data-qa="title-description"]');
-        if (titleDesc) {
-            const cleanText = titleDesc.textContent.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ');
-            if (cleanText.includes('ответить на несколько вопросов')) return 'outline';
+    // ============================================================
+    //  UI ПАНЕЛЬ (стили и шаблоны)
+    // ============================================================
+    const PANEL_CSS = `
+        #hh-autoapply-panel {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 420px;
+            max-height: 500px;
+            background: #1a1a2e;
+            border: 2px solid #e94560;
+            border-radius: 12px;
+            z-index: 99999;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 13px;
+            color: #eee;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            display: flex;
+            flex-direction: column;
         }
-
-        // Модалка с сопроводительным (обязательным или нет)
-        const modal = qs(SELECTORS.responseModal);
-        if (modal) {
-            const requiredText = modal.textContent || '';
-            if (requiredText.includes('Сопроводительное письмо обязательное')) return 'deferred';
-            // Если есть кнопка "Приложить письмо" — тоже deferred (письмо можно приложить)
-            if (qs(SELECTORS.coverLetterToggle, modal)) return 'deferred';
-            return 'instant';
+        #hh-autoapply-panel.minimized { max-height: 48px; }
+        #hh-autoapply-header {
+            background: #e94560;
+            padding: 12px 16px;
+            cursor: move;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: bold;
+            font-size: 14px;
+            user-select: none;
         }
-
-        // Страница отклика (не модалка)
-        if (detectPageType() === 'response') {
-            const cleanPageText = getPageText();
-            if (cleanPageText.includes('ответить на несколько вопросов')) return 'outline';
-            if (cleanPageText.includes('Сопроводительное письмо обязательное')) return 'deferred';
-            return 'instant';
+        #hh-autoapply-header button {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 18px;
+            cursor: pointer;
+            padding: 0 4px;
         }
+        #hh-autoapply-body {
+            padding: 12px 16px;
+            overflow-y: auto;
+            max-height: 400px;
+            flex: 1;
+        }
+        .hh-step-info {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            border-left: 3px solid #e94560;
+        }
+        .hh-step-info .step-label {
+            color: #e94560;
+            font-weight: bold;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        .hh-step-info .step-desc {
+            margin-top: 4px;
+            color: #ccc;
+            line-height: 1.4;
+        }
+        .hh-btn {
+            display: inline-block;
+            padding: 8px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            margin: 4px;
+            transition: all 0.2s;
+        }
+        .hh-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+        .hh-btn-primary { background: #e94560; color: white; }
+        .hh-btn-secondary { background: #0f3460; color: white; }
+        .hh-btn-success { background: #4CAF50; color: white; }
+        .hh-btn-warn { background: #FF9800; color: white; }
+        .hh-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+        .hh-stats { display: flex; gap: 12px; margin: 8px 0; flex-wrap: wrap; }
+        .hh-stat { background: #16213e; padding: 6px 12px; border-radius: 6px; text-align: center; }
+        .hh-stat-val { font-size: 18px; font-weight: bold; color: #e94560; }
+        .hh-stat-label { font-size: 10px; color: #888; text-transform: uppercase; }
+        #hh-autoapply-log {
+            background: #0d1117;
+            border-radius: 6px;
+            padding: 8px;
+            max-height: 120px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 11px;
+            margin-top: 8px;
+            line-height: 1.5;
+        }
+        .log-info { color: #58a6ff; }
+        .log-success { color: #3fb950; }
+        .log-warn { color: #d29922; }
+        .log-error { color: #f85149; }
+        .log-step { color: #bc8cff; }
+        .hh-btn-row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+        .hh-input-group { margin: 8px 0; display: flex; flex-direction: column; gap: 4px; }
+        .hh-input-group label { font-size: 11px; color: #888; text-transform: uppercase; font-weight: bold; }
+        .hh-input { background: #0d1117; border: 1px solid #444; color: #eee; padding: 6px 8px; border-radius: 4px; font-size: 12px; width: 100%; box-sizing: border-box; }
+        .hh-input:focus { border-color: #e94560; outline: none; }
+    `;
 
-        return 'unknown';
+    function statBlock(id, value, label, bordered) {
+        const border = bordered ? ' style="border:1px solid #e94560;"' : '';
+        return `
+            <div class="hh-stat"${border}>
+                <div class="hh-stat-val" id="${id}">${value}</div>
+                <div class="hh-stat-label">${label}</div>
+            </div>
+        `;
     }
 
-    // ============================================================
-    //  UI ПАНЕЛЬ
-    // ============================================================
-    function createUI() {
-        // Стили
-        GM_addStyle(`
-            #hh-autoapply-panel {
-                position: fixed;
-                bottom: 20px;
-                right: 20px;
-                width: 420px;
-                max-height: 500px;
-                background: #1a1a2e;
-                border: 2px solid #e94560;
-                border-radius: 12px;
-                z-index: 99999;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                font-size: 13px;
-                color: #eee;
-                overflow: hidden;
-                box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-                display: flex;
-                flex-direction: column;
-            }
-            #hh-autoapply-panel.minimized {
-                max-height: 48px;
-            }
-            #hh-autoapply-header {
-                background: #e94560;
-                padding: 12px 16px;
-                cursor: move;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                font-weight: bold;
-                font-size: 14px;
-                user-select: none;
-            }
-            #hh-autoapply-header button {
-                background: none;
-                border: none;
-                color: white;
-                font-size: 18px;
-                cursor: pointer;
-                padding: 0 4px;
-            }
-            #hh-autoapply-body {
-                padding: 12px 16px;
-                overflow-y: auto;
-                max-height: 400px;
-                flex: 1;
-            }
-            .hh-step-info {
-                background: #16213e;
-                border-radius: 8px;
-                padding: 10px 12px;
-                margin-bottom: 8px;
-                border-left: 3px solid #e94560;
-            }
-            .hh-step-info .step-label {
-                color: #e94560;
-                font-weight: bold;
-                font-size: 12px;
-                text-transform: uppercase;
-            }
-            .hh-step-info .step-desc {
-                margin-top: 4px;
-                color: #ccc;
-                line-height: 1.4;
-            }
-            .hh-btn {
-                display: inline-block;
-                padding: 8px 20px;
-                border: none;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: 600;
-                margin: 4px;
-                transition: all 0.2s;
-            }
-            .hh-btn:hover { opacity: 0.9; transform: translateY(-1px); }
-            .hh-btn-primary { background: #e94560; color: white; }
-            .hh-btn-secondary { background: #0f3460; color: white; }
-            .hh-btn-success { background: #4CAF50; color: white; }
-            .hh-btn-warn { background: #FF9800; color: white; }
-            .hh-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
-            .hh-stats {
-                display: flex;
-                gap: 12px;
-                margin: 8px 0;
-                flex-wrap: wrap;
-            }
-            .hh-stat {
-                background: #16213e;
-                padding: 6px 12px;
-                border-radius: 6px;
-                text-align: center;
-            }
-            .hh-stat-val { font-size: 18px; font-weight: bold; color: #e94560; }
-            .hh-stat-label { font-size: 10px; color: #888; text-transform: uppercase; }
-            #hh-autoapply-log {
-                background: #0d1117;
-                border-radius: 6px;
-                padding: 8px;
-                max-height: 120px;
-                overflow-y: auto;
-                font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 11px;
-                margin-top: 8px;
-                line-height: 1.5;
-            }
-            .log-info { color: #58a6ff; }
-            .log-success { color: #3fb950; }
-            .log-warn { color: #d29922; }
-            .log-error { color: #f85149; }
-            .log-step { color: #bc8cff; }
-            .hh-btn-row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
-        `);
+    function inputGroup(id, label, value, type = 'text') {
+        return `
+            <div class="hh-input-group">
+                <label for="${id}">${label}</label>
+                <input type="${type}" id="${id}" class="hh-input" value="${value}" />
+            </div>
+        `;
+    }
 
-        // Панель
-        const panel = document.createElement('div');
-        panel.id = 'hh-autoapply-panel';
-        panel.innerHTML = `
+    function panelHTML(dailyLimit) {
+        return `
             <div id="hh-autoapply-header">
-                <span>HH AutoApply (Trace)</span>
+                <span>HH AutoApply</span>
                 <div>
                     <button id="hh-btn-minimize" title="Свернуть">_</button>
                 </div>
             </div>
             <div id="hh-autoapply-body">
                 <div class="hh-stats">
-                    <div class="hh-stat">
-                        <div class="hh-stat-val" id="hh-stat-applied">0</div>
-                        <div class="hh-stat-label">Отклики</div>
-                    </div>
-                    <div class="hh-stat">
-                        <div class="hh-stat-val" id="hh-stat-skipped">0</div>
-                        <div class="hh-stat-label">Пропущено</div>
-                    </div>
-                    <div class="hh-stat">
-                        <div class="hh-stat-val" id="hh-stat-outline">0</div>
-                        <div class="hh-stat-label">Аутлайн</div>
-                    </div>
-                    <div class="hh-stat">
-                        <div class="hh-stat-val" id="hh-stat-total">0</div>
-                        <div class="hh-stat-label">Всего</div>
-                    </div>
-                    <div class="hh-stat" style="border: 1px solid #e94560;">
-                        <div class="hh-stat-val" id="hh-stat-daily">0</div>
-                        <div class="hh-stat-label">Дневной лимит / ${CONFIG.dailyLimit}</div>
-                    </div>
+                    ${statBlock('hh-stat-applied', '0', 'Отклики')}
+                    ${statBlock('hh-stat-outline', '0', 'Аутлайн')}
+                    ${statBlock('hh-stat-unclear', '0', 'Непонятное')}
+                    ${statBlock('hh-stat-questions', '0', 'Вопросы')}
+                    ${statBlock('hh-stat-total', '0', 'Всего')}
+                    ${statBlock('hh-stat-daily', '0', `Обработано / ${dailyLimit}`, true)}
                 </div>
+                ${inputGroup('hh-input-url', 'URL для поиска (редирект)', CONFIG.searchRedirectUrl)}
+                ${inputGroup('hh-input-limit', 'Дневной лимит обработки', CONFIG.dailyLimit, 'number')}
                 <div class="hh-step-info" id="hh-current-step">
                     <div class="step-label">Текущий шаг</div>
-                    <div class="step-desc" id="hh-step-desc">Нажмите "Собрать вакансии" для начала</div>
+                    <div class="hh-step-desc" id="hh-step-desc">Нажмите "Собрать вакансии" для начала</div>
                 </div>
                 <div class="hh-btn-row">
                     <button class="hh-btn hh-btn-primary" id="hh-btn-collect">Собрать вакансии</button>
                     <button class="hh-btn hh-btn-success" id="hh-btn-next" disabled>Next →</button>
                     <button class="hh-btn hh-btn-secondary" id="hh-btn-auto">Авто</button>
                     <button class="hh-btn hh-btn-warn" id="hh-btn-show-outline">Аутлайн</button>
-                    <button class="hh-btn hh-btn-error" id="hh-btn-clear-outline" style="background:#555;color:white;">Очистить</button>
+                    <button class="hh-btn hh-btn-warn" id="hh-btn-show-unclear" style="background:#d29922;">Непонятное</button>
+                    <button class="hh-btn" id="hh-btn-clear-outline" style="background:#555;color:white;">Очистить</button>
+                    <button class="hh-btn" id="hh-btn-download-questions" style="background:#3fb950;">Скачать вопросы</button>
+                </div>
+                <hr style="border-color:#444;margin:12px 0;">
+                <div style="font-size:11px;color:#888;text-transform:uppercase;font-weight:bold;margin-bottom:8px;">Обработка автоотказов</div>
+                <div class="hh-btn-row">
+                    <button class="hh-btn hh-btn-success" id="hh-btn-reject-next" style="flex:1;">Next Отказ →</button>
+                    <button class="hh-btn hh-btn-secondary" id="hh-btn-reject-auto">Авто-отказ</button>
                 </div>
                 <div id="hh-autoapply-log"></div>
             </div>
         `;
+    }
+
+    function createUI() {
+        GM_addStyle(PANEL_CSS);
+
+        const panel = document.createElement('div');
+        panel.id = 'hh-autoapply-panel';
+        panel.innerHTML = panelHTML(CONFIG.dailyLimit);
         document.body.appendChild(panel);
 
-        // Кнопки
-        const btnMinimize = document.getElementById('hh-btn-minimize');
-        if (btnMinimize) btnMinimize.onclick = () => panel.classList.toggle('minimized');
-        
-        const btnCollect = document.getElementById('hh-btn-collect');
-        if (btnCollect) btnCollect.onclick = collectVacancies;
-        
-        const btnNext = document.getElementById('hh-btn-next');
-        if (btnNext) btnNext.onclick = executeNextStep;
-        
-        const btnAuto = document.getElementById('hh-btn-auto');
-        if (btnAuto) btnAuto.onclick = toggleAutoMode;
-        
-        const btnShowOutline = document.getElementById('hh-btn-show-outline');
-        if (btnShowOutline) btnShowOutline.onclick = showOutlineLinks;
-        
-        const btnClearOutline = document.getElementById('hh-btn-clear-outline');
-        if (btnClearOutline) btnClearOutline.onclick = clearOutlineLinks;
-
+        bindButtons(panel);
+        initDragDrop(panel, 'hh-autoapply-header', 'hh_panel_pos');
         updateAutoButton();
+        updateAutoRejectButton();
 
         log('Панель загружена. Страница: ' + detectPageType());
+    }
+
+    function bindButtons(panel) {
+        const bind = (id, fn) => {
+            const el = document.getElementById(id);
+            if (el) el.onclick = fn;
+        };
+
+        const minimizeBtn = document.getElementById('hh-btn-minimize');
+        if (minimizeBtn) minimizeBtn.onclick = () => panel.classList.toggle('minimized');
+
+        bind('hh-btn-collect', collectVacancies);
+        bind('hh-btn-next', executeNextStep);
+        bind('hh-btn-auto', toggleAutoMode);
+        bind('hh-btn-show-outline', showOutlineLinks);
+        bind('hh-btn-show-unclear', showUnclearOutlineLinks);
+        bind('hh-btn-clear-outline', clearOutlineLinks);
+        bind('hh-btn-download-questions', downloadCollectedQuestions);
+        bind('hh-btn-reject-next', executeRejectNext);
+        bind('hh-btn-reject-auto', toggleAutoRejectMode);
+
+        const inputUrl = document.getElementById('hh-input-url');
+        if (inputUrl) {
+            inputUrl.addEventListener('change', (e) => {
+                CONFIG.searchRedirectUrl = e.target.value.trim();
+                saveConfig();
+                log('URL для поиска обновлен', 'success');
+            });
+        }
+
+        const inputLimit = document.getElementById('hh-input-limit');
+        if (inputLimit) {
+            inputLimit.addEventListener('change', (e) => {
+                const val = parseInt(e.target.value, 10);
+                if (!isNaN(val) && val > 0) {
+                    CONFIG.dailyLimit = val;
+                    saveConfig();
+                    updateStats();
+                    log('Дневной лимит обработки обновлен: ' + val, 'success');
+                }
+            });
+        }
+    }
+
+    function initDragDrop(panel, headerId, posKey) {
+        const header = document.getElementById(headerId);
+        if (!header) return;
+        let isDragging = false;
+        let dragOffsetX = 0;
+        let dragOffsetY = 0;
+
+        const savedPos = GM_getValue(posKey, null);
+        if (savedPos) {
+            panel.style.bottom = 'auto';
+            panel.style.right = 'auto';
+            panel.style.left = savedPos.left;
+            panel.style.top = savedPos.top;
+        }
+
+        header.addEventListener('mousedown', (e) => {
+            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
+            isDragging = true;
+            const rect = panel.getBoundingClientRect();
+            dragOffsetX = e.clientX - rect.left;
+            dragOffsetY = e.clientY - rect.top;
+
+            panel.style.bottom = 'auto';
+            panel.style.right = 'auto';
+            panel.style.margin = '0';
+
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+        });
+
+        function onMouseMove(e) {
+            if (!isDragging) return;
+            panel.style.left = (e.clientX - dragOffsetX) + 'px';
+            panel.style.top = (e.clientY - dragOffsetY) + 'px';
+        }
+
+        function onMouseUp() {
+            isDragging = false;
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+            GM_setValue(posKey, { left: panel.style.left, top: panel.style.top });
+        }
     }
 
     function updateLogPanel(msg, type = 'info') {
@@ -624,15 +940,16 @@ Email: pantin_42@inbox.ru`,
         logEl.scrollTop = logEl.scrollHeight;
     }
 
-    function updateStats() {
+    async function updateStats() {
         const el = (id) => document.getElementById(id);
         if (el('hh-stat-applied')) el('hh-stat-applied').textContent = STATE.appliedCount;
         if (el('hh-stat-skipped')) el('hh-stat-skipped').textContent = STATE.skippedCount;
-        if (el('hh-stat-outline')) el('hh-stat-outline').textContent = STATE.outlineLinks.length;
-        if (el('hh-stat-total')) el('hh-stat-total').textContent = STATE.vacancies.length || '-';
         if (el('hh-stat-daily')) {
             const daily = getDailyCount();
             const remaining = getRemainingDailyCount();
+            if (el('hh-stat-daily-label')) {
+                el('hh-stat-daily-label').textContent = `Дневной лимит / ${CONFIG.dailyLimit}`;
+            }
             el('hh-stat-daily').textContent = `${daily} / ${CONFIG.dailyLimit}`;
             // Если лимит исчерпан — подсвечиваем красным
             if (daily >= CONFIG.dailyLimit) {
@@ -641,6 +958,11 @@ Email: pantin_42@inbox.ru`,
                 el('hh-stat-daily').style.color = '#e94560';
             }
         }
+        if (el('hh-stat-outline')) el('hh-stat-outline').textContent = STATE.outlineLinks.length;
+        const questionsData = await GM_getValue('hh_autoapply_collected_questions', []);
+        if (el('hh-stat-questions')) el('hh-stat-questions').textContent = questionsData.length;
+        if (el('hh-stat-total')) el('hh-stat-total').textContent = STATE.vacancies.length || '-';
+
     }
 
     function setStepDesc(text) {
@@ -668,19 +990,28 @@ Email: pantin_42@inbox.ru`,
         STATE.currentVacancyIndex = 0;
 
         cards.forEach((card, idx) => {
+            const applyBtn = qs(SELECTORS.applyButton, card);
+
+            // Если кнопки отклика нет (уже откликнулись, отказ, приглашение и т.д.) - пропускаем
+            if (!applyBtn) {
+                log(`Пропускаю вакансию без кнопки "Откликнуться" (карточка #${idx + 1})`, 'info');
+                return;
+            }
+
             if (isAlreadyResponded(card)) {
                 log(`Пропускаю уже откликавшуюся вакансию (карточка #${idx + 1})`, 'info');
                 return;
             }
             const titleEl = qs(SELECTORS.vacancyTitleLink, card) || qs(SELECTORS.vacancyTitle, card);
             const title = titleEl ? titleEl.textContent.trim() : `Вакансия #${idx + 1}`;
+            const companyEl = qs(SELECTORS.companyName, card);
+            const company = companyEl ? companyEl.textContent.replace(/\s+/g, ' ').trim() : 'Неизвестная компания';
             const link = titleEl ? titleEl.href : '';
-            if (link && STATE.skippedVacancyUrls.includes(link)) {
+            if (isVacancySkipped(link)) {
                 log(`Пропускаю запомненную аутлайн-вакансию: ${link}`, 'info');
                 return;
             }
-            const applyBtn = qs(SELECTORS.applyButton, card);
-
+            
             STATE.vacancies.push({
                 index: idx,
                 title: title,
@@ -688,15 +1019,51 @@ Email: pantin_42@inbox.ru`,
                 applyBtn: applyBtn,
                 card: card,
             });
+            STATE.vacancies[STATE.vacancies.length - 1].company = company;
         });
 
         updateStats();
+        saveState(); // Сохраняем состояние после сбора
 
         // Если вакансий не найдено — переходим по URL и ждём
         if (STATE.vacancies.length === 0) {
+            STATE.emptyPageRetries = (STATE.emptyPageRetries || 0) + 1;
+            
+            if (STATE.emptyPageRetries >= 3) {
+                if (STATE.emptyPageRestarts >= 1) {
+                    log('Снова нет вакансий после паузы. Окончательная остановка авто-режима.', 'error');
+                    setStepDesc('Нет вакансий. Авто-режим полностью остановлен.');
+                    STATE.isRunning = false;
+                    STATE.retryDelay = 0;
+                    STATE.emptyPageRetries = 0;
+                    STATE.emptyPageRestarts = 0;
+                    saveState();
+                    updateAutoButton();
+                    return false;
+                } else {
+                    log('Нет вакансий 3 раза подряд. Отключаю авто-режим, пауза 10 секунд...', 'warn');
+                    setStepDesc('Нет вакансий. Пауза 10 сек перед перезапуском...');
+                    STATE.isRunning = false;
+                    STATE.retryDelay = 0;
+                    STATE.emptyPageRestarts = 1;
+                    STATE.emptyPageRetries = 0;
+                    saveState();
+                    updateAutoButton();
+                    
+                    emptyPageTimeout = setTimeout(() => {
+                        log('Возобновляю авто-режим после паузы...', 'info');
+                        STATE.isRunning = true;
+                        saveState();
+                        updateAutoButton();
+                        redirectSearch();
+                    }, 10000);
+                    return false;
+                }
+            }
+
             const delay = STATE.retryDelay || 3000;
-            log(`Вакансии не найдены. Перехожу по URL и жду ${delay/1000} сек...`, 'warn');
-            setStepDesc(`Вакансии не найдены. Перезагрузка (ожидание ${delay/1000} сек)...`);
+            log(`Вакансии не найдены (попытка ${STATE.emptyPageRetries}/3). Перехожу по URL и жду ${delay/1000} сек...`, 'warn');
+            setStepDesc(`Вакансии не найдены. Перезагрузка (попытка ${STATE.emptyPageRetries}/3)...`);
             // Увеличиваем задержку для следующего раза: 0→3сек, 3→7сек, 7→7сек
             STATE.retryDelay = STATE.retryDelay === 0 ? 3000 : 7000;
             saveState();
@@ -704,8 +1071,10 @@ Email: pantin_42@inbox.ru`,
             return false;
         }
         
-        // Сброс retryDelay при успешном сборе
+        // Сброс счетчиков при успешном сборе
         STATE.retryDelay = 0;
+        STATE.emptyPageRetries = 0;
+        STATE.emptyPageRestarts = 0;
 
         log(`Найдено ${STATE.vacancies.length} вакансий на странице`, 'success');
         setStepDesc(`Найдено ${STATE.vacancies.length} вакансий. Нажмите Next для отклика на первую.`);
@@ -716,8 +1085,8 @@ Email: pantin_42@inbox.ru`,
     // Проверка дневного лимита
     function checkDailyLimitAndStop() {
         if (isDailyLimitReached()) {
-            log('Достигнут дневной лимит откликов! (' + CONFIG.dailyLimit + ')', 'error');
-            setStepDesc('⚠ Достигнут дневной лимит (' + CONFIG.dailyLimit + ' откликов)! Скрипт остановлен до завтра.');
+            log('Достигнут дневной лимит обработки вакансий! (' + CONFIG.dailyLimit + ')', 'error');
+            setStepDesc('⚠ Достигнут дневной лимит (' + CONFIG.dailyLimit + ' обработок)! Скрипт остановлен до завтра.');
             document.getElementById('hh-btn-next').disabled = true;
             // Останавливаем авто-режим если запущен
             if (autoInterval) {
@@ -735,10 +1104,11 @@ Email: pantin_42@inbox.ru`,
 
     // Регистрирует успешный отклик и проверяет лимит
     function registerSuccessfulApply(title) {
-        STATE.appliedCount++;
         incrementDailyCount();
+        STATE.appliedCount++;
         log(`Отклик зарегистрирован: "${title}"`, 'success');
         updateStats();
+        saveState();
         return checkDailyLimitAndStop();
     }
 
@@ -746,6 +1116,7 @@ Email: pantin_42@inbox.ru`,
     async function executeNextStep() {
         // Проверяем дневной лимит перед каждым шагом
         if (checkDailyLimitAndStop()) return;
+        saveState(); // Сохраняем состояние в начале каждого шага
 
             if (STATE.currentVacancyIndex >= STATE.vacancies.length) {
             log('Все вакансии обработаны!', 'success');
@@ -754,16 +1125,16 @@ Email: pantin_42@inbox.ru`,
             
             // Если включён авто-режим — перезапрашиваем страницу для новых вакансий
             if (STATE.isRunning) {
-                log('Авто-режим: все вакансии обработаны. Перезапрашиваю страницу...', 'success');
-                setTimeout(() => {
-                    try {
-                        if (window.location.href.split('#')[0] === CONFIG.searchRedirectUrl.split('#')[0]) {
+                if (detectPageType() === 'search') {
+                    log('Авто-режим: все вакансии обработаны. Перезапрашиваю страницу...', 'success');
+                    setTimeout(() => {
+                        try {
                             window.location.reload();
-                        } else {
-                            window.location.href = CONFIG.searchRedirectUrl;
+                        } catch (e) {
+                            redirectSearch();
                         }
-                    } catch (e) { }
-                }, 3000);
+                    }, 3000);
+                }
             }
             return;
         }
@@ -787,22 +1158,15 @@ Email: pantin_42@inbox.ru`,
         }
     }
 
-    // Шаг на странице поиска: клик "Откликнуться" → ждём 3 сек → модалка/inline/редирект
+    // Шаг на странице поиска: клик "Откликнуться" → единый пайплайн
     async function handleSearchPageStep(vacancy) {
         log(`Шаг: Обработка "${vacancy.title}"`, 'step');
         setStepDesc(`Отклик на: "${vacancy.title}"\nНажимаю кнопку отклика...`);
 
         if (!vacancy.applyBtn) {
-            log('Кнопка отклика не найдена, пробуем перейти по ссылке вакансии', 'warn');
-            // Переходим на страницу вакансии
-            if (vacancy.link) {
-                log(`Переход: ${vacancy.link}`, 'info');
-                window.location.href = vacancy.link;
-                return;
-            }
+            log('Кнопка отклика не найдена, пропускаю вакансию', 'warn');
             STATE.skippedCount++;
-            STATE.currentVacancyIndex++;
-            updateStats();
+            finishVacancy(vacancy, `Пропущено (нет кнопки): "${vacancy.title}".`);
             return;
         }
 
@@ -812,146 +1176,59 @@ Email: pantin_42@inbox.ru`,
         await wait(CONFIG.clickDelay);
         vacancy.applyBtn.click();
 
-        // Ждём 3 секунды — за это время может появиться модалка, inline-карточка с кнопкой "Приложить письмо" или редирект
-        await wait(3000);
+        // Окно "отклик в другую страну"
+        await checkAndHandleRelocationWarning();
+        await wait(DELAYS.animation);
 
-        // Проверяем — появилась модалка?
-        const modal = qs(SELECTORS.responseModal);
-        if (modal) {
-            log('Появилась модалка отклика!', 'step');
-            const rtype = detectResponseType();
-            log(`Тип отклика: ${rtype}`, 'info');
-            await handleModalStep(vacancy, rtype);
-            return;
-        }
-
-        // Проверяем редирект на страницу вопросов
-        if (detectPageType() === 'response') {
-            log('Редирект на страницу отклика (вопросы) — сохраняю в аутлайн и возвращаюсь на поиск', 'step');
-            addToOutline(vacancy.title, vacancy.link || window.location.href);
-            STATE.returnedFromOutline = true;
-            saveState();
-            try {
-                window.location.href = CONFIG.searchRedirectUrl;
-            } catch (e) {
-                log('Не удалось перенаправить: ' + e.message, 'error');
-            }
-            return;
-        }
-
-        // Проверяем: может ли быть модальное окно требования письма прямо на странице поиска (сценарий 2)
-        const coverLetterTextarea = qs(SELECTORS.coverLetterInput) || qs(SELECTORS.coverLetterInputAlt);
-        if (coverLetterTextarea && detectPageType() === 'search') {
-            log('Обнаружено модальное окно требования письма на странице поиска (сценарий 2)', 'step');
-            const handled = await handleModalForCoverLetterOnSearchPage(vacancy);
-            if (handled) {
-                STATE.appliedCount++;
-                incrementDailyCount();
-                STATE.currentVacancyIndex++;
-                updateStats();
-                if (isDailyLimitReached()) {
-                    log('Достигнут дневной лимит откликов! (' + CONFIG.dailyLimit + ')', 'error');
-                    setStepDesc('⚠ Достигнут дневной лимит (' + CONFIG.dailyLimit + ' откликов)!');
-                    return;
-                }
-                setStepDesc(`Письмо добавлено и отклик отправлен: "${vacancy.title}". Нажмите Next для следующей.`);
-                return;
-            }
-        }
-
-        // Проверяем inline-карточку с кнопкой "Приложить письмо" (сценарий 1)
-        const inlineToggle = qs(SELECTORS.coverLetterToggle);
-        if (inlineToggle) {
-            log('Найден интерфейс "Приложить письмо" после отклика на странице поиска', 'step');
-            const handled = await handleInlineCoverLetterCard(vacancy);
-            if (handled) {
-                STATE.currentVacancyIndex++;
-                updateStats();
-                setStepDesc(`Письмо приложено: "${vacancy.title}". Нажмите Next для следующей.`);
-                return;
-            }
-        }
-
-        log('Модалка не появилась. Пропускаю.', 'warn');
-        STATE.skippedCount++;
-        STATE.currentVacancyIndex++;
-        updateStats();
-        setStepDesc(`Пропущено: "${vacancy.title}". Нажмите Next для следующей.`);
-    }
-
-    // Шаг в модалке
-    async function handleModalStep(vacancy, responseType) {
-        if (responseType === 'instant') {
-            log('Мгновенный отклик — просто нажимаю "Откликнуться"', 'step');
-            setStepDesc('Мгновенный отклик. Нажимаю "Откликнуться"...');
-
-            const submitBtn = qs(SELECTORS.submitButton);
-            if (submitBtn && !submitBtn.disabled) {
-                submitBtn.click();
-                if (registerSuccessfulApply(vacancy.title)) return;
-            } else {
-                // Кнопка disabled — возможно нужно выбрать резюме
-                log('Кнопка disabled. Возможно нужно выбрать резюме.', 'warn');
-                setStepDesc('Кнопка "Откликнуться" неактивна. Выберите резюме вручную, затем нажмите Next.');
-                // Ждём ручного выбора резюме
-                return;
-            }
-        } else if (responseType === 'deferred') {
-            log('Отложенный отклик — требуется сопроводительное письмо', 'step');
-            setStepDesc('Заполняю сопроводительное письмо...');
-
-            let textarea = getCoverLetterField();
-            if (!textarea) textarea = await ensureCoverLetterFieldVisible();
-            if (textarea) {
-                fillTextarea(textarea);
-                log('Сопроводительное вставлено!', 'success');
-                await wait(500);
-
-                // Теперь кнопка должна стать активной
-                const submitBtn = qs(SELECTORS.submitButton);
-                if (submitBtn && !submitBtn.disabled) {
-                    log('Нажимаю "Откликнуться"...', 'step');
-                    submitBtn.click();
-                    if (registerSuccessfulApply(vacancy.title)) return;
-                } else {
-                    log('Сопроводительное вставлено, но кнопка disabled. Возможно нужно выбрать резюме.', 'warn');
-                    setStepDesc('Сопроводительное вставлено, но кнопка disabled. Выберите резюме и нажмите Next.');
-                    return;
-                }
-            }
-        } else if (responseType === 'outline') {
-            log('Аутлайн — вопросы работодателя. Сохраняю ссылку.', 'warn');
-            addToOutline(vacancy.title, vacancy.link || window.location.href);
-            saveState();
-
-            // Закрываем модалку
-            const closeBtn = qs(SELECTORS.responseModalClose);
-            if (closeBtn) closeBtn.click();
-        }
-
-        STATE.currentVacancyIndex++;
-        updateStats();
-
-        // Ждём закрытия модалки
-        await wait(800);
-        setStepDesc(`Обработано ${STATE.currentVacancyIndex}/${STATE.vacancies.length}. Нажмите Next для следующей.`);
+        // Определяем исход: аутлайн → модалка → поле письма
+        const outcome = await waitForApplyOutcome(vacancy, 8000);
+        await runUnifiedApply(vacancy, outcome);
     }
 
     // Добавляет вакансию в аутлайн с проверкой на дубликат по URL
-    function addToOutline(title, url) {
+    function addToOutline(title, url, company = 'Неизвестно') {
         // Проверяем, нет ли уже такой ссылки в аутлайне
         const exists = STATE.outlineLinks.some(item => item.link === url);
         if (exists) {
             log(`Вакансия уже в аутлайне: "${title}"`, 'info');
             return false;
         }
-        STATE.outlineLinks.push({ title: title, link: url });
+        STATE.outlineLinks.push({ title: title, link: url, company: company, sessionId: currentSessionId });
+        incrementDailyCount();
         // Также запоминаем URL, чтобы пропускать при сборе
         if (url && !STATE.skippedVacancyUrls.includes(url)) {
             STATE.skippedVacancyUrls.push(url);
         }
         log(`Добавлено в аутлайн: "${title}"`, 'warn');
         return true;
+    }
+
+    // Добавляет вакансию в список "Непонятное" и в основной "Аутлайн"
+    function addToUnclearOutline(title, url, company = 'Неизвестно') {
+        // Проверяем, нет ли уже такой ссылки в списке
+        const exists = STATE.unclearOutlineLinks.some(item => item.link === url);
+        if (!exists) {
+            STATE.unclearOutlineLinks.push({ title: title, link: url, company: company, sessionId: currentSessionId });
+            log(`Добавлено в "Непонятное": "${title}"`, 'warn');
+        }
+        // Также добавляем в основной аутлайн, чтобы вакансия была пропущена при следующем сборе
+        addToOutline(title, url, company);
+        return true;
+    }
+
+    // Проверяет, должна ли вакансия быть пропущена (по точному URL или по ID вакансии)
+    function isVacancySkipped(link) {
+        if (!link) return false;
+        if (STATE.skippedVacancyUrls.includes(link)) return true;
+        const idMatch = link.match(/\/vacancy\/(\d+)/);
+        if (idMatch) {
+            const id = idMatch[1];
+            return STATE.skippedVacancyUrls.some(u => {
+                const m = u.match(/\/vacancy\/(\d+)/) || u.match(/vacancyId=(\d+)/);
+                return m && m[1] === id;
+            });
+        }
+        return false;
     }
 
     // Проверяет, есть ли на странице отклика отметка "Вы откликнулись"
@@ -968,121 +1245,214 @@ Email: pantin_42@inbox.ru`,
 
     // Пытается извлечь название вакансии из текста страницы
     function extractVacancyTitleFromPage() {
-        // На странице вопросов (аутлайн) название вакансии лежит в блоке data-qa="vacancy-credentials"
-        const credsBlock = qs('[data-qa="vacancy-credentials"]');
-        if (credsBlock) {
-            // Внутри ищем элемент с data-qa="cell-text-content" (там название)
-            const titleEl = credsBlock.querySelector('[data-qa="cell-text-content"]');
-            if (titleEl) {
-                const text = titleEl.textContent.trim();
-                if (text) return text;
+        let title = 'Неизвестная вакансия';
+        let company = 'Неизвестная компания';
+
+        // На странице отклика (response page)
+        if (detectPageType() === 'response') {
+            // Заголовок вакансии: сначала стабильный блок credentials, затем общий заголовок страницы
+            const matched = firstMatch([SELECTORS.responseCredsTitle, SELECTORS.responseMainTitle]);
+            if (matched) {
+                const candidate = matched.el.textContent.trim();
+                if (candidate === 'Отклик на вакансию' && matched.selector === SELECTORS.responseMainTitle) {
+                    log('Заголовок — служебный "Отклик на вакансию", название не извлечено', 'warn');
+                } else {
+                    title = candidate;
+                }
             }
+
+            // Название компании: aria-label аватара, затем текстовый элемент (ХРУПКИЕ селекторы)
+            const sidebarColumn = qs(SELECTORS.responseSidebarColumn);
+            if (sidebarColumn) {
+                const companyAvatar = sidebarColumn.querySelector(SELECTORS.responseCompanyAvatar);
+                if (companyAvatar && companyAvatar.getAttribute('aria-label')) {
+                    const ariaLabel = companyAvatar.getAttribute('aria-label').trim();
+                    if (ariaLabel) company = ariaLabel;
+                } else {
+                    // Если аватара нет, ищем текстовый элемент компании, который не является заголовком вакансии
+                    const companyTextEl = sidebarColumn.querySelector('[data-qa="cell-text-content"]');
+                    if (companyTextEl) {
+                        let potentialCompany = companyTextEl.textContent.replace(/\s+/g, ' ').trim();
+                        if (potentialCompany.startsWith('Другое ')) { // Удаляем префикс "Другое"
+                            potentialCompany = potentialCompany.substring('Другое '.length).trim();
+                        }
+                        if (potentialCompany !== title) { // Убедимся, что это не название вакансии
+                            company = potentialCompany;
+                        }
+                    }
+                }
+            }
+        } else { // Для других типов страниц (например, поиска)
+            const titleEl = qs(SELECTORS.vacancyTitleLink) || qs(SELECTORS.vacancyTitle);
+            if (titleEl) title = titleEl.textContent.trim();
+            const companyEl = qs(SELECTORS.companyName);
+            if (companyEl) company = companyEl.textContent.replace(/\s+/g, ' ').trim();
         }
-        // Пробуем найти заголовок вакансии на странице
-        const titleEl = qs('[data-qa="vacancy-title"]') || 
-                        qs('[data-qa="title"]') || 
-                        qs('h1') ||
-                        qs('[data-qa="vacancy-response__title"]');
-        if (titleEl) {
-            const text = titleEl.textContent.trim();
-            if (text) return text;
+
+        // Финальный запасной вариант для заголовка из title страницы
+        if ((title === 'Неизвестная вакансия' || !title) && document.title) {
+            title = document.title.replace(/— hh\.ru$/, '').replace(/— HH\.RU$/i, '').trim();
         }
-        // Пробуем извлечь из document.title (обычно там "Название вакансии — hh.ru")
-        if (document.title) {
-            let t = document.title.replace(/— hh\.ru$/, '').replace(/— HH\.RU$/i, '').trim();
-            if (t) return t;
+
+        return { title, company };
+    }
+
+    // Функция для сбора информации о вопросах и сохранения в хранилище
+    async function collectAndStoreQuestions() {
+        log('Сбор данных со страницы с вопросами для последующего анализа...', 'step');
+    
+        const { title, company } = extractVacancyTitleFromPage();
+        const url = window.location.href;
+    
+        const collectedData = {
+            vacancyTitle: title, // Используем извлеченный заголовок
+            companyName: company, // Используем извлеченную компанию
+            // Сохраняем полный URL для точной идентификации опросника.
+            vacancyUrl: url,
+            answers: [] // Изменено с questions на answers для совместимости
+        };
+    
+        const questionBlocks = qsa(SELECTORS.taskBody);
+        if (questionBlocks.length === 0) {
+            log('Не найдено блоков с вопросами на странице.', 'warn');
+            return;
         }
-        return 'Неизвестная вакансия';
+    
+        for (const block of questionBlocks) {
+            const questionTextEl = qs(SELECTORS.taskQuestion, block);
+            const question = {
+                question: questionTextEl ? questionTextEl.innerText.trim() : 'Текст вопроса не найден'
+            };
+    
+            const radioButtons = qsa('input[type="radio"]', block);
+            const checkboxes = qsa('input[type="checkbox"]', block);
+            const textField = qs('textarea', block) || qs('input[type="text"]', block);
+    
+            if (radioButtons.length > 0) {
+                question.type = 'radio';
+                // Логика сбора вариантов для radio-кнопок (аналогично checkbox)
+                question.options = qsa('[data-qa="cell-text-content"]', block).map(label => label.textContent.trim());
+            } else if (checkboxes.length > 0) {
+                question.type = 'checkbox';
+                // --- НОВОЕ: Сбор вариантов ответа для чекбоксов ---
+                question.options = qsa('[data-qa="cell-text-content"]', block).map(label => label.textContent.trim());
+            } else if (textField) {
+                question.type = textField.tagName.toLowerCase(); // 'textarea' или 'input'
+            }
+
+            question.answer = ""; // Добавляем пустое поле для ответа
+    
+            collectedData.answers.push(question); // Добавляем в массив answers
+        }
+    
+        // Сохранение в хранилище
+        const allQuestions = await GM_getValue('hh_autoapply_collected_questions', []);
+
+        // --- НОВАЯ ПРОВЕРКА НА ДУБЛИКАТЫ ---
+        const isDuplicate = allQuestions.some(item => item.vacancyUrl === collectedData.vacancyUrl);
+        if (isDuplicate) {
+            log(`Вопросы для этой вакансии (URL) уже сохранены. Пропускаю дубликат.`, 'info');
+            return;
+        }
+
+        if (collectedData.answers.length > 0) {
+            allQuestions.push(collectedData); // Сохраняем новую структуру
+            await GM_setValue('hh_autoapply_collected_questions', allQuestions);
+            log(`Данные о ${collectedData.answers.length} вопросах сохранены. Всего в хранилище: ${allQuestions.length}`, 'success');
+            updateStats();
+        } else {
+            log('На странице не найдено вопросов для сохранения.', 'warn');
+        }
+    }
+
+    // Функция для скачивания накопленных вопросов
+    async function downloadCollectedQuestions() {
+        const allQuestions = await GM_getValue('hh_autoapply_collected_questions', []);
+        if (allQuestions.length === 0) {
+            log('Нет накопленных данных о вопросах для скачивания.', 'warn');
+            return;
+        }
+
+        const jsonString = JSON.stringify(allQuestions, null, 2);
+        const blob = new Blob([jsonString], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `collected_questions_${new Date().toISOString().split('T')[0]}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        log(`Файл с ${allQuestions.length} наборами вопросов скачан.`, 'success');
+        URL.revokeObjectURL(url); // Освобождаем память
     }
 
     // Шаг на странице отклика /applicant/vacancy_response
     async function handleResponsePageStep() {
-        const rtype = detectResponseType();
-        log(`Страница отклика. Тип: ${rtype}`, 'step');
+        const creds = extractVacancyTitleFromPage();
+        const vacancy = {
+            title: creds.title,
+            company: creds.company,
+            link: window.location.href,
+            card: null,
+        };
+        log(`Страница отклика: "${vacancy.title}"`, 'step');
+        setStepDesc(`Страница отклика: "${vacancy.title}".`);
 
-        if (rtype === 'outline') {
-            // Проверяем, не откликнулись ли уже на эту вакансию
-            if (isAlreadyRespondedOnPage()) {
-                log('Уже откликнулись на эту вакансию — пропускаем (не заносим в аутлайн)', 'info');
-                STATE.skippedCount++;
-                STATE.currentVacancyIndex++;
-                updateStats();
-                setStepDesc('Уже откликнулись. Пропускаем.');
-                return;
-            }
+        const outcome = await waitForApplyOutcome(vacancy, 5000);
+        const status = await runUnifiedApply(vacancy, outcome);
 
-            log('Это страница с вопросами — аутлайн!', 'warn');
-            const title = extractVacancyTitleFromPage();
-            addToOutline(title, window.location.href);
-            STATE.returnedFromOutline = true;
+        // После обработки страницы отклика возвращаемся на поиск
+        if (status !== 'disabled' && status !== 'stopped') {
+            STATE.returnedFromOutline = !!STATE.isRunning;
             saveState();
-            log(`Сохранено в аутлайн, перенаправляю на поиск...`, 'info');
-            
             redirectSearch();
-            return;
         }
-
-        // Если на этой странице просто нужно заполнить cover letter
-        let textarea = getCoverLetterField();
-        if (!textarea) textarea = await ensureCoverLetterFieldVisible();
-        if (textarea) {
-            fillTextarea(textarea);
-            log('Сопроводительное вставлено на странице отклика!', 'success');
-            setStepDesc('Сопроводительное вставлено. Нажмите Next для отправки.');
-            return;
-        }
-
-        // Пробуем нажать submit
-        const submitBtn = qs(SELECTORS.submitButton);
-        if (submitBtn && !submitBtn.disabled) {
-            submitBtn.click();
-            if (registerSuccessfulApply('Вакансия (на странице отклика)')) return;
-        } else {
-            log('Не удалось отправить отклик на этой странице', 'warn');
-        }
-
-        STATE.currentVacancyIndex++;
-        updateStats();
     }
 
     // Шаг на странице вакансии /vacancy/ (если попали туда по ссылке)
     async function handleVacancyPageStep() {
         log('Страница вакансии — ищу кнопку отклика', 'step');
 
-        // Кнопка "Откликнуться" на странице вакансии
-        const applyBtn = qs('[data-qa="vacancy-response-link-top"]') ||
-                         qs('[data-qa="vacancy-response-link-bottom"]') ||
-                         qs('button[data-qa*="response"]');
+        const applyMatch = firstMatch([
+            SELECTORS.vacancyApplyTop,
+            SELECTORS.vacancyApplyBottom,
+            SELECTORS.anyResponseButton,
+        ]);
+        const applyBtn = applyMatch ? applyMatch.el : null;
 
-        if (applyBtn) {
-            applyBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await wait(500);
-            applyBtn.click();
-            log('Нажал кнопку отклика на странице вакансии', 'step');
-            await wait(1500);
-
-            // Проверяем модалку
-            const modal = qs(SELECTORS.responseModal);
-            if (modal) {
-                const vacancy = {
-                    title: document.title,
-                    link: window.location.href,
-                };
-                const rtype = detectResponseType();
-                await handleModalStep(vacancy, rtype);
-            }
-        } else {
+        if (!applyBtn) {
             log('Кнопка отклика не найдена на странице вакансии', 'warn');
             STATE.skippedCount++;
-            STATE.currentVacancyIndex++;
+            saveState();
             updateStats();
+            return;
         }
+
+        const vacancy = {
+            title: document.title,
+            link: window.location.href,
+            company: '',
+            card: null,
+            applyBtn: applyBtn,
+        };
+
+        applyBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await wait(DELAYS.small);
+        applyBtn.click();
+        log('Нажал кнопку отклика на странице вакансии', 'step');
+
+        await checkAndHandleRelocationWarning();
+        await wait(DELAYS.wait);
+
+        const outcome = await waitForApplyOutcome(vacancy, 8000);
+        await runUnifiedApply(vacancy, outcome);
     }
 
     // ============================================================
     //  АВТОМАТИЧЕСКИЙ РЕЖИМ (заглушка — будет реализован позже)
     // ============================================================
     let autoInterval = null;
+    let emptyPageTimeout = null;
 
     function scheduleNextStep(delayMs = 2000) {
         if (!STATE.isRunning) return;
@@ -1094,6 +1464,10 @@ Email: pantin_42@inbox.ru`,
     }
 
     function toggleAutoMode() {
+        if (emptyPageTimeout) {
+            clearTimeout(emptyPageTimeout);
+            emptyPageTimeout = null;
+        }
         STATE.isRunning = !STATE.isRunning;
         saveState();
         updateAutoButton();
@@ -1145,21 +1519,74 @@ Email: pantin_42@inbox.ru`,
     // ============================================================
     //  АУТЛАЙН (вакансии с вопросами)
     // ============================================================
-    function clearOutlineLinks() {
-        if (STATE.outlineLinks.length === 0) {
-            log('Аутлайн уже пуст', 'info');
+    async function clearOutlineLinks() {
+        const questionsData = await GM_getValue('hh_autoapply_collected_questions', []);
+
+        if (STATE.outlineLinks.length === 0 && STATE.unclearOutlineLinks.length === 0 && questionsData.length === 0) {
+            log('Все списки ("Аутлайн", "Непонятное", "Вопросы") уже пусты.', 'info');
             return;
         }
-
-        if (confirm('Очистить список аутлайна (' + STATE.outlineLinks.length + ' вакансий)?')) {
+        const confirmMsg = `Вы уверены, что хотите очистить все списки?\n\n` +
+                         `- Аутлайн: ${STATE.outlineLinks.length} шт.\n` +
+                         `- Непонятное: ${STATE.unclearOutlineLinks.length} шт.\n` +
+                         `- Собранные вопросы: ${questionsData.length} шт.`;
+        if (confirm(confirmMsg)) {
             STATE.outlineLinks = [];
+            STATE.unclearOutlineLinks = [];
             // Также очищаем skippedVacancyUrls, чтобы эти вакансии снова обрабатывались
             STATE.skippedVacancyUrls = [];
+            GM_setValue('hh_autoapply_collected_questions', []);
             saveState();
             updateStats();
             log('Список аутлайна очищен', 'success');
             setStepDesc('Аутлайн очищен. Вакансии снова будут обрабатываться.');
         }
+    }
+
+    // ============================================================
+    //  МОДАЛЬНЫЕ ОКНА (общая реализация)
+    // ============================================================
+    function showModal({ title, color, bodyBg, bodyHTML, closeId }) {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:100000;display:flex;align-items:center;justify-content:center;';
+        const modal = document.createElement('div');
+        modal.style.cssText = `background:${bodyBg};border:2px solid ${color};border-radius:12px;padding:24px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;color:#eee;font-family:sans-serif;`;
+        modal.innerHTML = `
+            ${bodyHTML}
+            <br><button id="${closeId}" style="padding:8px 24px;background:${color};color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px;">Закрыть</button>
+        `;
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        document.getElementById(closeId).onclick = () => overlay.remove();
+        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    }
+
+    function listItemHTML(item, idx, borderColor, bg) {
+        return `
+            <div style="margin:8px 0;padding:8px;background:${bg};border-radius:6px;border-left:3px solid ${borderColor};">
+                <strong>${idx}. ${item.title}</strong> <span style="color:#aaa;">(${item.company || '?'})</span><br>
+                <a href="${item.link}" target="_blank" style="color:#58a6ff;word-break:break-all;">${item.link}</a>
+            </div>
+        `;
+    }
+
+    function listModalHTML(items, color, bg, newColor, oldColor) {
+        const oldLinks = items.filter(item => item.sessionId !== currentSessionId);
+        const newLinks = items.filter(item => item.sessionId === currentSessionId);
+        let html = '';
+        let globalIndex = 1;
+
+        if (newLinks.length > 0) {
+            html += `<h3 style="color:${newColor}; margin: 16px 0 8px 0;">Новые (текущий прогон)</h3>`;
+            html += newLinks.map(item => listItemHTML(item, globalIndex++, newColor, bg)).join('');
+        }
+        if (oldLinks.length > 0) {
+            if (newLinks.length > 0) html += `<hr style="border-color:#444; margin: 24px 0;">`;
+            html += `<h3 style="color:${oldColor}; margin: 16px 0 8px 0;">Ранее добавленные</h3>`;
+            html += oldLinks.map(item => listItemHTML(item, globalIndex++, oldColor, bg)).join('');
+        }
+        return html;
     }
 
     // ============================================================
@@ -1177,160 +1604,378 @@ Email: pantin_42@inbox.ru`,
             log(`${idx + 1}. ${item.title}\n   ${item.link}`, 'warn');
         });
 
-        // Показываем в модальном окне
-        const overlay = document.createElement('div');
-        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:100000;display:flex;align-items:center;justify-content:center;';
-        const modal = document.createElement('div');
-        modal.style.cssText = 'background:#1a1a2e;border:2px solid #e94560;border-radius:12px;padding:24px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;color:#eee;font-family:sans-serif;';
-        let html = `<h2 style="color:#e94560;margin-top:0">Аутлайн (${STATE.outlineLinks.length})</h2><p>Вакансии, требующие ручной обработки:</p>`;
-        STATE.outlineLinks.forEach((item, idx) => {
-            html += `<div style="margin:8px 0;padding:8px;background:#16213e;border-radius:6px;">
-                <strong>${idx + 1}. ${item.title}</strong><br>
-                <a href="${item.link}" target="_blank" style="color:#58a6ff;word-break:break-all;">${item.link}</a>
-            </div>`;
+        showModal({
+            title: 'Аутлайн',
+            color: '#e94560',
+            bodyBg: '#1a1a2e',
+            closeId: 'hh-outline-close',
+            bodyHTML: `
+                <h2 style="color:#e94560;margin-top:0">Аутлайн (${STATE.outlineLinks.length})</h2>
+                <p>Вакансии, требующие ручной обработки:</p>
+                ${listModalHTML(STATE.outlineLinks, '#e94560', '#16213e', '#3fb950', '#888')}
+            `,
         });
-        html += `<br><button id="hh-outline-close" style="padding:8px 24px;background:#e94560;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px;">Закрыть</button>`;
-        modal.innerHTML = html;
-        overlay.appendChild(modal);
-        document.body.appendChild(overlay);
+    }
 
-        document.getElementById('hh-outline-close').onclick = () => overlay.remove();
-        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    // ============================================================
+    //  ПОКАЗ СПИСКА "НЕПОНЯТНОЕ"
+    // ============================================================
+    function showUnclearOutlineLinks() {
+        if (STATE.unclearOutlineLinks.length === 0) {
+            log('Список "Непонятное" пуст.', 'info');
+            setStepDesc('Список "Непонятное" пуст.');
+            return;
+        }
+
+        log(`=== НЕПОНЯТНОЕ (${STATE.unclearOutlineLinks.length} вакансий) ===`, 'error');
+        STATE.unclearOutlineLinks.forEach((item, idx) => {
+            log(`${idx + 1}. ${item.title}\n   ${item.link}`, 'error');
+        });
+
+        showModal({
+            title: 'Непонятное',
+            color: '#f85149',
+            bodyBg: '#2e1a1a',
+            closeId: 'hh-unclear-close',
+            bodyHTML: `
+                <h2 style="color:#f85149;margin-top:0">Непонятное (${STATE.unclearOutlineLinks.length})</h2>
+                <p>Вакансии, где скрипт не смог определить результат:</p>
+                ${listModalHTML(STATE.unclearOutlineLinks, '#f85149', '#221616', '#FF9800', '#888')}
+            `,
+        });
+    }
+
+    // ============================================================
+    //  ОБРАБОТКА АВТООТКАЗОВ (ЧАТЫ)
+    // ============================================================
+    function toggleAutoRejectMode() {
+        REJECT_STATE.isRunning = !REJECT_STATE.isRunning;
+        updateAutoRejectButton();
+        
+        if (REJECT_STATE.isRunning) {
+            log('Авто-режим отказов запущен', 'success');
+            executeRejectNext();
+        } else {
+            log('Авто-режим отказов остановлен', 'warn');
+            if (autoRejectInterval) {
+                clearTimeout(autoRejectInterval);
+                autoRejectInterval = null;
+            }
+        }
+    }
+
+    function updateAutoRejectButton() {
+        const btn = document.getElementById('hh-btn-reject-auto');
+        if (!btn) return;
+        if (REJECT_STATE.isRunning) {
+            btn.textContent = 'Стоп (Отказ)';
+            btn.classList.remove('hh-btn-secondary');
+            btn.classList.add('hh-btn-warn');
+        } else {
+            btn.textContent = 'Авто-отказ';
+            btn.classList.remove('hh-btn-warn');
+            btn.classList.add('hh-btn-secondary');
+        }
+    }
+
+    async function executeRejectNext() {
+        if (!location.pathname.includes('/chat') && !location.pathname.includes('/applicant/negotiations')) {
+            log('Для работы с отказами перейдите на страницу чатов (/chat или /applicant/negotiations)', 'error');
+            if (REJECT_STATE.isRunning) toggleAutoRejectMode();
+            return;
+        }
+
+        // Дадим странице немного времени на полную прорисовку
+        await wait(DELAYS.small);
+
+        // 1. Проверяем и включаем галочку "Только непрочитанные", если она выключена
+        const unreadLabel = qsa('label').find(l => (l.textContent || '').toLowerCase().includes('непрочитан'));
+        if (unreadLabel) {
+            const cb = unreadLabel.querySelector('input[type="checkbox"]');
+            if (cb && !cb.checked) {
+                log('Включаю галочку "Только непрочитанные"...', 'info');
+                cb.click();
+                await wait(DELAYS.animation); // Ждем подгрузки списка
+            }
+        } else {
+            const unreadBtn = qsa('button, [role="checkbox"]').find(b => (b.textContent || '').toLowerCase().includes('непрочитан'));
+            if (unreadBtn && unreadBtn.getAttribute('aria-checked') === 'false') {
+                log('Включаю фильтр "Только непрочитанные"...', 'info');
+                unreadBtn.click();
+                await wait(DELAYS.animation);
+            }
+        }
+
+        log('Ищу непрочитанные сообщения с отказами или "свяжемся с вами"...', 'info');
+        
+        // Получаем все элементы, которые могут быть карточкой чата в списке
+        const chatItems = qsa('[data-qa*="item"], a[href*="/chat/"]');
+        let targetEl = null;
+
+        for (const el of chatItems) {
+            // Пропускаем крупные списки-контейнеры
+            if (el.tagName === 'UL' || el.tagName === 'OL') continue;
+
+            // Если этот элемент внутри уже обработанного (или наоборот содержит его), пропускаем
+            let alreadyProcessed = false;
+            for (const processedNode of REJECT_STATE.processedNodes) {
+                if (processedNode.contains(el) || el.contains(processedNode)) {
+                    alreadyProcessed = true;
+                    break;
+                }
+            }
+            if (alreadyProcessed) continue;
+
+            // 3. Проверка на наличие счетчика непрочитанных сообщений
+            const badge = qs(SELECTORS.chatUnreadBadge, el);
+            if (!badge) continue; // Нет бейджа — сообщение уже прочитано, пропускаем
+
+            // 2. Проверяем наличие ключевых слов для отказа (в нижнем регистре)
+            const text = (el.textContent || '').toLowerCase();
+            const keywords = [
+                // --- Текущие базовые ---
+                'отказ',
+                'свяжемся с вами',
+                'рассмотрим ваше резюме',
+                'к сожалению',
+                'закрыли эту позицию',
+
+                // --- Прямые отказы ---
+                'вынуждены отказать',
+                'не готовы пригласить',
+                'не готовы продолжить',
+                'не сможем предложить',
+                'не готовы предложить',
+                'сделали выбор в пользу другого',
+                'отдали предпочтение',
+                'остановились на другом',
+                'вакансия закрыта',
+                'приостановили поиск',
+                'поиск приостановлен',
+                'поставлена на паузу',
+                'желаем удачи в поисках',
+                'успехов в поиске',
+                'дальнейших профессиональных успехов',
+
+                // --- Кадровый резерв (фактический отказ по текущей заявке) ---
+                'сохраним ваше резюме',
+                'в кадровый резерв',
+                'будем иметь вас в виду',
+                'вернемся к вам, если',
+                'если появится подходящая',
+
+                // --- Автоответы-заглушки ---
+                'внимательно ознакомились',
+                'передали ваше резюме',
+                'передано руководителю',
+                'передали руководителю',
+                'спасибо за отклик',
+                'спасибо за проявленный интерес',
+                'благодарим за интерес'
+            ];
+            if (keywords.some(keyword => text.includes(keyword))) {
+                targetEl = el;
+                REJECT_STATE.processedNodes.add(el);
+                break;
+            }
+        }
+
+        if (!targetEl) {
+            log('Новых сообщений с отказами не найдено на экране. Попробуйте прокрутить список ниже.', 'warn');
+            if (REJECT_STATE.isRunning) toggleAutoRejectMode();
+            return;
+        }
+
+        log('Найдено сообщение с отказом, кликаю...', 'step');
+        
+        // Скроллим к элементу, чтобы он был в зоне видимости
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await wait(300);
+        
+        // Находим кликабельный узел (ссылку или кнопку внутри карточки, либо саму карточку)
+        const clickable = targetEl.tagName === 'A' || targetEl.tagName === 'BUTTON' ? targetEl : (qs('a, button', targetEl) || targetEl);
+        
+        try {
+            clickable.click();
+        } catch (e) {
+            log('Не удалось кликнуть по сообщению: ' + e.message, 'error');
+        }
+
+        log('Жду 2 секунды...', 'info');
+        await wait(DELAYS.step);
+        
+        if (REJECT_STATE.isRunning) {
+            autoRejectInterval = setTimeout(() => {
+                if (REJECT_STATE.isRunning) executeRejectNext();
+            }, 100);
+        } else {
+            log('Готово. Можно нажимать "Next Отказ" для следующего.', 'success');
+        }
     }
 
     // ============================================================
     //  ЗАПУСК И ИНИЦИАЛИЗАЦИЯ
     // ============================================================
-    function init() {
+    async function init() {
         // Проверяем, что мы на hh.ru
         if (!location.hostname.includes('hh.ru')) return;
 
         // Восстанавливаем состояние после редиректа
         const savedState = GM_getValue('hh_autoapply_state', null);
         if (savedState) {
-            STATE.outlineLinks = savedState.outlineLinks || [];
-            STATE.appliedCount = savedState.appliedCount || 0;
-            STATE.skippedCount = savedState.skippedCount || 0;
             STATE.skippedVacancyUrls = savedState.skippedVacancyUrls || [];
             STATE.returnedFromOutline = savedState.returnedFromOutline || false;
             STATE.isRunning = savedState.isRunning || false;
             STATE.retryDelay = savedState.retryDelay || 0;
+            STATE.emptyPageRetries = savedState.emptyPageRetries || 0;
+            STATE.emptyPageRestarts = savedState.emptyPageRestarts || 0;
+            // Восстанавливаем аутлайн и вакансии
+            STATE.outlineLinks = savedState.outlineLinks || [];
+            STATE.unclearOutlineLinks = savedState.unclearOutlineLinks || [];
+            // Восстанавливаем счетчики
+            STATE.appliedCount = savedState.appliedCount || 0;
+            STATE.skippedCount = savedState.skippedCount || 0;
+            if (savedState.vacancies && savedState.vacancies.length > 0) {
+                STATE.vacancies = savedState.vacancies;
+                STATE.currentVacancyIndex = savedState.currentVacancyIndex || 0;
+                log(`Восстановлено ${STATE.vacancies.length} вакансий из предыдущей сессии.`, 'success');
+            }
         }
 
-        // Ждём загрузки страницы
-        const checkReady = setInterval(() => {
-            if (document.readyState === 'complete' || document.readyState === 'interactive') {
-                clearInterval(checkReady);
-                createUI();
-                log('Скрипт загружен. Тип страницы: ' + detectPageType(), 'success');
-                log('Дневной лимит: ' + getDailyCount() + '/' + CONFIG.dailyLimit + ' откликов', 'info');
+        // Создаем UI
+        createUI();
+        await updateStats(); // Обновляем статистику сразу после создания UI
+        log('Скрипт загружен. Тип страницы: ' + detectPageType(), 'success');
+        log(`Дневной лимит обработок: ${getDailyCount()}/${CONFIG.dailyLimit}`, 'info');
 
-                // Если мы на странице отклика после редиректа
-                if (detectPageType() === 'response') {
-                    log('Обнаружена страница отклика (возможно после редиректа)', 'step');
-                    handleResponsePageRedirect();
-                    return;
-                }
-
-                // Если вернулись со страницы вопросов (outline) — ждём 5 сек и собираем вакансии
-                if (STATE.returnedFromOutline) {
-                    log('Вернулись со страницы вопросов. Через 5 сек автоматически соберу вакансии...', 'step');
-                    STATE.returnedFromOutline = false;
-                    saveState();
-                    
-                    setTimeout(() => {
-                        log('Автоматически выполняю "Собрать вакансии"...', 'info');
-                        // Ждём пока страница станет страницей поиска и появятся карточки
-                        const waitForSearch = setInterval(() => {
-                            const pageType = detectPageType();
-                            const hasCards = !!document.querySelector(SELECTORS.vacancyCard);
-                            log(`Жду поиск: pageType=${pageType}, cards=${hasCards}`, 'info');
-                            if (pageType === 'search' && hasCards) {
-                                clearInterval(waitForSearch);
-                                collectVacancies();
-                                resumeAutoMode();
-                            }
-                        }, 1000);
-                        // Если через 20 сек всё ещё не страница поиска — пробуем собрать в любом случае
-                        setTimeout(() => {
-                            clearInterval(waitForSearch);
-                            if (detectPageType() === 'search') {
-                                collectVacancies();
-                            } else {
-                                log('Страница не загрузилась как поиск. Перезагружаю...', 'warn');
-                                redirectSearch();
-                            }
-                        }, 20000);
-                    }, 5000);
-                    return;
-                }
-                
-                // Если был retryDelay (не нашли вакансий) — ждём 5 сек и собираем
-                if (detectPageType() === 'search' && STATE.retryDelay > 0) {
-                    log('Ожидаю 5 сек перед сбором вакансий...', 'step');
-                    
-                    setTimeout(() => {
-                        log('Автоматически выполняю "Собрать вакансии"...', 'info');
-                        const collected = collectVacancies();
-                        if (!collected) return;
-                        resumeAutoMode();
-                    }, 5000);
-                return;
+        // Если есть восстановленные вакансии, активируем кнопку Next
+        if (STATE.vacancies.length > 0 && STATE.currentVacancyIndex < STATE.vacancies.length) {
+            document.getElementById('hh-btn-next').disabled = false;
+            // Убедимся, что DOM-элементы для текущей вакансии существуют, если нет - пересобираем
+            if (detectPageType() === 'search' && (!STATE.vacancies[STATE.currentVacancyIndex].card || !STATE.vacancies[STATE.currentVacancyIndex].applyBtn)) {
+                log('DOM-элементы не найдены, пересобираю вакансии на странице...', 'info');
+                collectVacancies();
             }
+            setStepDesc(`Готов к работе. ${STATE.currentVacancyIndex + 1}/${STATE.vacancies.length}: "${STATE.vacancies[STATE.currentVacancyIndex].title}"`);
+        } else {
+            setStepDesc('Нажмите "Собрать вакансии" для начала');
+        }
 
-            // Если мы перезагрузили страницу (или перешли на новую) и авто-режим активен
-            if (detectPageType() === 'search' && STATE.isRunning) {
-                log('Авто-режим активен. Жду прогрузки карточек вакансий...', 'step');
-                let attempts = 0;
-                const waitCards = setInterval(() => {
-                    attempts++;
-                    if (document.querySelector(SELECTORS.vacancyCard)) {
-                        clearInterval(waitCards);
+        // Если мы на странице отклика после редиректа
+        if (detectPageType() === 'response') {
+            log('Обнаружена страница отклика (возможно после редиректа)', 'step');
+            handleResponsePageRedirect();
+            return;
+        }
+
+        // Если вернулись со страницы вопросов (outline) — ждём 5 сек и собираем вакансии
+        if (STATE.returnedFromOutline) {
+            log('Вернулись со страницы вопросов. Через 5 сек автоматически соберу вакансии...', 'step');
+            STATE.returnedFromOutline = false;
+            saveState();
+            
+            setTimeout(() => {
+                log('Автоматически выполняю "Собрать вакансии"...', 'info');
+                // Ждём пока страница станет страницей поиска и появятся карточки
+                const waitForSearch = setInterval(() => {
+                    const pageType = detectPageType();
+                    const hasCards = !!document.querySelector(SELECTORS.vacancyCard);
+                    log(`Жду поиск: pageType=${pageType}, cards=${hasCards}`, 'info');
+                    if (pageType === 'search' && hasCards) {
+                        clearInterval(waitForSearch);
                         collectVacancies();
+                        saveState(); // Сохраняем состояние после сбора
                         resumeAutoMode();
-                    } else if (attempts >= 20) { // Ждем до 10 секунд (20 * 500ms)
-                        clearInterval(waitCards);
-                        collectVacancies(); // Вызовет логику retryDelay, если ничего не найдет
                     }
-                }, 500);
-                }
-            }
-        }, 500);
+                }, 1000);
+                // Если через 20 сек всё ещё не страница поиска — пробуем собрать в любом случае
+                setTimeout(() => {
+                    clearInterval(waitForSearch);
+                    if (detectPageType() === 'search') {
+                        collectVacancies();
+                        saveState(); // Сохраняем состояние после сбора
+                    } else {
+                        log('Страница не загрузилась как поиск. Перезагружаю...', 'warn');
+                        redirectSearch();
+                    }
+                }, 20000);
+            }, 5000);
+            return;
+        }
+        
+        // Если был retryDelay (не нашли вакансий) — ждём 5 сек и собираем
+        if (detectPageType() === 'search' && STATE.retryDelay > 0) {
+            log('Ожидаю 5 сек перед сбором вакансий...', 'step');
+            
+            setTimeout(() => {
+                log('Автоматически выполняю "Собрать вакансии"...', 'info');
+                const collected = collectVacancies();
+                saveState(); // Сохраняем состояние после сбора
+                if (!collected) return;
+                resumeAutoMode();
+            }, 5000);
+        return;
     }
 
-    // Обработка при загрузке на странице отклика (редирект из модалки)
+    // Если мы перезагрузили страницу (или перешли на новую) и авто-режим активен
+    if (detectPageType() === 'search' && STATE.isRunning) {
+        log('Авто-режим активен. Жду прогрузки карточек вакансий...', 'step');
+        let attempts = 0;
+        const waitCards = setInterval(() => {
+            attempts++;
+            if (document.querySelector(SELECTORS.vacancyCard)) {
+                clearInterval(waitCards);
+                collectVacancies();
+                saveState(); // Сохраняем состояние после сбора
+                resumeAutoMode();
+            } else if (attempts >= 20) { // Ждем до 10 секунд (20 * 500ms)
+                clearInterval(waitCards);
+                collectVacancies(); // Вызовет логику retryDelay, если ничего не найдет
+                saveState(); // Сохраняем состояние после сбора
+            }
+        }, 500);
+        }
+    }
+
+    // Обработка при загрузке на странице отклика (редирект из модалки или от клика на карточке)
     async function handleResponsePageRedirect() {
-        const rtype = detectResponseType();
-        log(`Тип отклика на странице: ${rtype}`, 'info');
-        setStepDesc(`Страница отклика. Тип: ${rtype}. Нажмите Next для обработки.`);
+        const creds = extractVacancyTitleFromPage();
+        const vacancy = {
+            title: creds.title,
+            company: creds.company,
+            link: window.location.href,
+            card: null,
+        };
+        log(`Страница отклика: "${vacancy.title}"`, 'info');
 
         document.getElementById('hh-btn-next').disabled = false;
 
-        // Если аутлайн — автоматически сохраняем и перенаправляем
-        if (rtype === 'outline') {
-            // Проверяем, не откликнулись ли уже на эту вакансию
-            if (isAlreadyRespondedOnPage()) {
-                log('Уже откликнулись на эту вакансию — пропускаем (не заносим в аутлайн)', 'info');
-                updateStats();
-                log('Перенаправляю на поиск...', 'info');
-                redirectSearch();
-                return;
-            }
-
-            log('Вопросы работодателя — автоматически сохраняю в аутлайн и перенаправляю на поиск', 'warn');
-            const title = extractVacancyTitleFromPage();
-            addToOutline(title, window.location.href);
-            STATE.returnedFromOutline = true;
-            updateStats();
-            
-            // Сохраняем состояние и перенаправляем
-            saveState();
-            log('Перенаправляю на поиск...', 'info');
-            redirectSearch();
+        // Сценарий 3: вопросы работодателя — автоматически в аутлайн
+        if (isOutlineDetected()) {
+            await handleOutlineOutcome(vacancy);
             return;
         }
+
+        // В авто-режиме обрабатываем сразу (письмо → "Отправить")
+        if (STATE.isRunning) {
+            const outcome = await waitForApplyOutcome(vacancy, 5000);
+            const status = await runUnifiedApply(vacancy, outcome === 'none' ? 'response' : outcome);
+            if (status !== 'disabled' && status !== 'stopped') {
+                STATE.returnedFromOutline = true;
+                saveState();
+                redirectSearch();
+            }
+            return;
+        }
+
+        setStepDesc(`Страница отклика: "${vacancy.title}". Нажмите Next для обработки.`);
     }
 
     // Запуск
-    init();
+    // Ждём полной загрузки страницы перед запуском
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        init();
+    } else {
+        window.addEventListener('DOMContentLoaded', init);
+    }
 })();
