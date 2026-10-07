@@ -45,12 +45,22 @@ Email: pantin_42@inbox.ru`,
         searchRedirectUrl: savedConfig.searchRedirectUrl || "https://tver.hh.ru/search/vacancy?area=113&ored_clusters=true&text=QA+Engineer+%28Manual+%2B+Automation%29&items_on_page=100&search_session_id=c9efa11b-53d2-4327-bba5-2cfb1c5d521c",
         // Дневной лимит откликов
         dailyLimit: savedConfig.dailyLimit || 150,
+        // Не останавливаться при капче: закрыть её, пропустить вакансию и продолжить (на свой риск)
+        ignoreCaptcha: !!savedConfig.ignoreCaptcha,
     };
+
+    const CAPTCHA_IGNORE_WARNING =
+        'ВНИМАНИЕ!\n\n' +
+        'Работа без остановки с игнорированием капчи возможна, но за корректную работу скрипта, ' +
+        'сохранность аккаунта и корректную обработку откликов никто не отвечает.\n\n' +
+        'При капче скрипт закроет её окно, пропустит вакансию (она попадёт в «Непонятное») и продолжит.\n\n' +
+        'Включить?';
 
     function saveConfig() {
         GM_setValue('hh_autoapply_config', {
             searchRedirectUrl: CONFIG.searchRedirectUrl,
-            dailyLimit: CONFIG.dailyLimit
+            dailyLimit: CONFIG.dailyLimit,
+            ignoreCaptcha: CONFIG.ignoreCaptcha,
         });
     }
 
@@ -118,6 +128,11 @@ Email: pantin_42@inbox.ru`,
         respondedMarker: '[data-qa="vacancy-serp__vacancy_responded"]',
         // --- Модалка предупреждения об отказе ---
         responseRejectWarning: '[data-qa="response-reject-warning"]',
+        // --- Капча ---
+        captchaPicture: '[data-qa="account-captcha-picture"]',
+        captchaInput: '[data-qa="account-captcha-input"]',
+        captchaError: '[data-qa="account-captcha-error"]',
+        captchaImageSrc: 'img[src*="/captcha/picture"]',
         // --- Заголовок/описание на странице отклика ---
         titleDescription: '[data-qa="title-description"]',
 
@@ -134,6 +149,13 @@ Email: pantin_42@inbox.ru`,
 
         // --- Отказы (чаты): бейдж непрочитанных ---
         chatUnreadBadge: '[data-qa="chatik-info-badges"]',
+        // Карточка чата (скелетоны загрузки имеют data-qa="chatik-skeleton-chat-…" и сюда не попадают)
+        chatCell: 'a[data-qa^="chatik-open-chat-"]',
+        chatCellTitle: '[data-qa="chat-cell-title"]',
+        chatCellSubtitle: '[data-qa="chat-cell-subtitle"]',
+        // Текст последнего сообщения (у блока нет data-qa, только хешированный класс)
+        chatLastMessage: '[class*="last-message-color"], [class^="last-message--"]',
+        chatOnlyUnreadCheckbox: 'input[data-qa="chatik-checkbox-only-unread"]',
     };
 
     // ============================================================
@@ -158,7 +180,10 @@ Email: pantin_42@inbox.ru`,
     };
 
     const REJECT_STATE = {
-        processedNodes: new Set(),
+        // ID чатов (строки списка виртуальные и переиспользуются — DOM-узлы запоминать нельзя)
+        processedIds: new Set(),
+        // Чаты, которые не трогаем (приглашения/вопросы/непонятное) — чтобы не логировать повторно
+        keptIds: new Set(),
         isRunning: false
     };
     let autoRejectInterval = null;
@@ -299,6 +324,10 @@ Email: pantin_42@inbox.ru`,
         const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
             window.HTMLTextAreaElement.prototype, 'value'
         ).set;
+        // Очистка ОБЯЗАТЕЛЬНА: стираем старое содержимое, иначе текст задублируется
+        nativeInputValueSetter.call(textarea, '');
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        // Вставляем шаблон
         nativeInputValueSetter.call(textarea, letterText);
         textarea.dispatchEvent(new Event('input', { bubbles: true }));
         textarea.dispatchEvent(new Event('change', { bubbles: true }));
@@ -369,6 +398,77 @@ Email: pantin_42@inbox.ru`,
         return !!(getCoverLetterField() || qs(SELECTORS.coverLetterToggle) || qs(SELECTORS.addCoverLetterBtn));
     }
 
+    // Элемент реально отображается (hh держит закрытые модалки в DOM)
+    function isVisible(el) {
+        return !!el && document.documentElement.contains(el) && el.getClientRects().length > 0;
+    }
+
+    function visibleDialogs() {
+        return qsa('[role="dialog"]').filter(isVisible);
+    }
+
+    const CAPTCHA_TEXT_RE = /пройдите капчу|подтвердите, что вы не робот|подтвердить, что вы не робот/i;
+    const CAPTCHA_SELECTORS = ['captchaPicture', 'captchaInput', 'captchaError', 'captchaImageSrc'];
+
+    // Капча: модал «Пройдите капчу» или полностраничный редирект на /captcha
+    function isCaptchaDetected() {
+        if (CAPTCHA_SELECTORS.some(key => qsa(SELECTORS[key]).some(isVisible))) return true;
+        if (/\/captcha/i.test(window.location.href)) return true;
+        // innerText не включает скрытые элементы — закрытая капча не даёт ложных срабатываний
+        return CAPTCHA_TEXT_RE.test(normText(document.body.innerText));
+    }
+
+    function getCaptchaDialog() {
+        return visibleDialogs().find(d =>
+            CAPTCHA_SELECTORS.some(key => qs(SELECTORS[key], d)) || CAPTCHA_TEXT_RE.test(normText(d.textContent))
+        ) || null;
+    }
+
+    // Клик, который понимают React-кнопки magritte (полная последовательность событий)
+    function realClick(el) {
+        const target = (el.closest && el.closest('button, [role="button"], a')) || el;
+        const opts = { bubbles: true, cancelable: true, view: window };
+        try {
+            target.dispatchEvent(new PointerEvent('pointerdown', opts));
+            target.dispatchEvent(new MouseEvent('mousedown', opts));
+            target.dispatchEvent(new PointerEvent('pointerup', opts));
+            target.dispatchEvent(new MouseEvent('mouseup', opts));
+        } catch (e) { /* не критично */ }
+        target.click();
+    }
+
+    function pressEscape(target) {
+        const opts = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+        target.dispatchEvent(new KeyboardEvent('keydown', opts));
+        target.dispatchEvent(new KeyboardEvent('keyup', opts));
+    }
+
+    // Закрывает модальное окно: кнопка с текстом → крестик в шапке → Escape
+    async function closeDialog(dialog, buttonText) {
+        if (!dialog) return true;
+        const candidates = [];
+        if (buttonText) {
+            const footer = qs('[data-qa="modal-footer"]', dialog) || dialog;
+            const byText = findButtonByText(footer, buttonText, false);
+            if (byText) candidates.push(byText);
+        }
+        const headerBtn = qs('[data-qa="modal-header"] button', dialog);
+        if (headerBtn) candidates.push(headerBtn);
+        const qaClose = qs(SELECTORS.responseModalClose, dialog);
+        if (qaClose) candidates.push(qaClose);
+
+        for (const btn of candidates) {
+            try { btn.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' }); } catch (e) { /* не критично */ }
+            realClick(btn);
+            await wait(DELAYS.small);
+            if (!isVisible(dialog)) return true;
+        }
+        pressEscape(dialog);
+        pressEscape(document);
+        await wait(DELAYS.small);
+        return !isVisible(dialog);
+    }
+
     // Кнопка/span с точным текстом (в т.ч. magritte-label)
     function findButtonByText(root, text, excludeApply) {
         const isApply = (el) => excludeApply && el.matches(SELECTORS.applyButton);
@@ -414,6 +514,7 @@ Email: pantin_42@inbox.ru`,
 
     // Какой исход появился после клика "Откликнуться"
     function detectApplyOutcome(vacancy) {
+        if (isCaptchaDetected()) return 'captcha';
         if (isOutlineDetected()) return 'outline';
         if (qs(SELECTORS.responseModal)) return 'modal';
         if (detectPageType() === 'response') return isAlreadyRespondedOnPage() ? 'responded' : 'response';
@@ -431,6 +532,7 @@ Email: pantin_42@inbox.ru`,
         let previous = null;
         while (Date.now() - start < timeoutMs) {
             const outcome = detectApplyOutcome(vacancy);
+            if (outcome === 'captcha') return 'captcha';
             if (outcome === 'outline') return 'outline';
             if (outcome && outcome === previous) {
                 if (outcome === 'responded') {
@@ -463,6 +565,7 @@ Email: pantin_42@inbox.ru`,
 
     // Единое действие: приложить письмо -> нажать "Отправить" -> подтвердить
     async function attachLetterAndSubmit(vacancy) {
+        if (isCaptchaDetected()) return 'captcha';
         if (isOutlineDetected()) {
             await handleOutlineOutcome(vacancy);
             return 'outline';
@@ -488,6 +591,7 @@ Email: pantin_42@inbox.ru`,
         }
 
         // Вопросы могли проявиться, пока заполняли письмо
+        if (isCaptchaDetected()) return 'captcha';
         if (isOutlineDetected()) {
             await handleOutlineOutcome(vacancy);
             return 'outline';
@@ -507,6 +611,7 @@ Email: pantin_42@inbox.ru`,
         }
 
         // 3. Жмём "Отправить"
+        if (isCaptchaDetected()) return 'captcha';
         const startPageType = detectPageType();
         const hadModal = !!qs(SELECTORS.responseModal);
         try {
@@ -528,6 +633,8 @@ Email: pantin_42@inbox.ru`,
         const start = Date.now();
         let closedStreak = 0;
         while (Date.now() - start < timeoutMs) {
+            // Капча — останавливаемся (нельзя взаимодействовать с формой)
+            if (isCaptchaDetected()) return 'captcha';
             // Вопросы работодателя -> аутлайн
             if (isOutlineDetected()) {
                 await handleOutlineOutcome(vacancy);
@@ -585,9 +692,48 @@ Email: pantin_42@inbox.ru`,
         setStepDesc(message || `Обработано ${STATE.currentVacancyIndex}/${STATE.vacancies.length}. Нажмите Next для следующей.`);
     }
 
+    // Капча: по настройке либо стоп, либо закрыть и пропустить вакансию
+    function handleCaptcha(vacancy) {
+        return CONFIG.ignoreCaptcha ? handleCaptchaIgnore(vacancy) : handleCaptchaStop(vacancy);
+    }
+
+    // Режим «не останавливаться»: закрываем капчу, вакансию — в «Непонятное», работаем дальше
+    async function handleCaptchaIgnore(vacancy) {
+        const title = (vacancy && vacancy.title) || 'вакансия';
+        log(`Капча при отклике: "${title}". Игнорирую (настройка), вакансия → "Непонятное".`, 'warn');
+        await dismissCaptcha();
+        // Окно отклика под капчей тоже закрываем, чтобы не мешало следующей вакансии
+        const responseModal = qs(SELECTORS.responseModal);
+        if (isVisible(responseModal)) await closeDialog(responseModal.closest('[role="dialog"]') || responseModal, 'Закрыть');
+        if (vacancy) addToUnclearOutline(title, vacancy.link || window.location.href, vacancy.company);
+        STATE.skippedCount++;
+        saveState();
+        finishVacancy(vacancy, `Капча проигнорирована: "${title}" — в "Непонятное".`);
+        return 'skipped';
+    }
+
+    // Закрыть окно капчи; на полностраничной капче — вернуться на поиск
+    async function dismissCaptcha() {
+        const dialog = getCaptchaDialog();
+        if (dialog) {
+            const closed = await closeDialog(dialog, null);
+            log(closed ? 'Окно капчи закрыто' : 'Окно капчи закрыть не удалось', closed ? 'step' : 'warn');
+            return closed;
+        }
+        if (/\/captcha/i.test(window.location.href)) {
+            log('Страница капчи — возвращаюсь на поиск', 'warn');
+            STATE.returnedFromOutline = !!STATE.isRunning;
+            saveState();
+            redirectSearch();
+        }
+        return false;
+    }
+
     // Единый пайплайн: разбираем исход клика и доводим отклик до конца
     async function runUnifiedApply(vacancy, outcome, depth = 0) {
         log(`Исход отклика: ${outcome}`, 'info');
+
+        if (outcome === 'captcha') return handleCaptcha(vacancy);
 
         if (outcome === 'outline') {
             await handleOutlineOutcome(vacancy);
@@ -612,6 +758,7 @@ Email: pantin_42@inbox.ru`,
         const result = await attachLetterAndSubmit(vacancy);
 
         if (result === 'disabled') return 'disabled';
+        if (result === 'captcha') return handleCaptcha(vacancy);
         if (result === 'outline') return 'outline';
 
         if (result === 'success') {
@@ -763,6 +910,8 @@ Email: pantin_42@inbox.ru`,
         .hh-input-group label { font-size: 11px; color: #888; text-transform: uppercase; font-weight: bold; }
         .hh-input { background: #0d1117; border: 1px solid #444; color: #eee; padding: 6px 8px; border-radius: 4px; font-size: 12px; width: 100%; box-sizing: border-box; }
         .hh-input:focus { border-color: #e94560; outline: none; }
+        .hh-check { display: flex; align-items: center; gap: 6px; margin: 8px 0 2px; font-size: 12px; color: #ccc; cursor: pointer; }
+        .hh-check-note { font-size: 11px; color: #f85149; margin-bottom: 6px; }
     `;
 
     function statBlock(id, value, label, bordered) {
@@ -803,6 +952,13 @@ Email: pantin_42@inbox.ru`,
                 </div>
                 ${inputGroup('hh-input-url', 'URL для поиска (редирект)', CONFIG.searchRedirectUrl)}
                 ${inputGroup('hh-input-limit', 'Дневной лимит обработки', CONFIG.dailyLimit, 'number')}
+                <label class="hh-check">
+                    <input type="checkbox" id="hh-input-ignore-captcha" ${CONFIG.ignoreCaptcha ? 'checked' : ''} />
+                    Не останавливаться при капче
+                </label>
+                <div class="hh-check-note" id="hh-ignore-captcha-note" style="display:${CONFIG.ignoreCaptcha ? 'block' : 'none'};">
+                    ⚠ Капча игнорируется — работа на свой риск
+                </div>
                 <div class="hh-step-info" id="hh-current-step">
                     <div class="step-label">Текущий шаг</div>
                     <div class="hh-step-desc" id="hh-step-desc">Нажмите "Собрать вакансии" для начала</div>
@@ -881,6 +1037,23 @@ Email: pantin_42@inbox.ru`,
                     updateStats();
                     log('Дневной лимит обработки обновлен: ' + val, 'success');
                 }
+            });
+        }
+
+        const inputIgnoreCaptcha = document.getElementById('hh-input-ignore-captcha');
+        if (inputIgnoreCaptcha) {
+            inputIgnoreCaptcha.addEventListener('change', (e) => {
+                if (e.target.checked && !window.confirm(CAPTCHA_IGNORE_WARNING)) {
+                    e.target.checked = false;
+                    return;
+                }
+                CONFIG.ignoreCaptcha = e.target.checked;
+                saveConfig();
+                const note = document.getElementById('hh-ignore-captcha-note');
+                if (note) note.style.display = CONFIG.ignoreCaptcha ? 'block' : 'none';
+                log(CONFIG.ignoreCaptcha
+                    ? 'Капча игнорируется: скрипт не будет останавливаться (на свой риск)'
+                    : 'При капче скрипт будет останавливаться', CONFIG.ignoreCaptcha ? 'warn' : 'success');
             });
         }
     }
@@ -1112,10 +1285,44 @@ Email: pantin_42@inbox.ru`,
         return checkDailyLimitAndStop();
     }
 
+    // СТОП при капче: скрипт замирает, пользователь решает капчу вручную
+    function handleCaptchaStop(vacancy) {
+        const title = (vacancy && vacancy.title) || 'вакансия';
+        console.error('[HH-AUTOAPPLY] Капча при отклике! Пройдите капчу вручную, затем запустите скрипт снова. ' +
+            '(Можно включить "Не останавливаться при капче" в настройках панели — на свой риск.)');
+        log(`Капча при отклике: "${title}". Скрипт остановлен.`, 'error');
+        setStepDesc(`КАПЧА при отклике: "${title}".\nПройдите её вручную и запустите скрипт снова.`);
+        const nextBtn = document.getElementById('hh-btn-next');
+        if (nextBtn) nextBtn.disabled = true;
+        if (autoInterval) {
+            clearTimeout(autoInterval);
+            autoInterval = null;
+        }
+        if (emptyPageTimeout) {
+            clearTimeout(emptyPageTimeout);
+            emptyPageTimeout = null;
+        }
+        STATE.isRunning = false;
+        saveState();
+        updateAutoButton();
+        updateStats();
+        return 'stopped';
+    }
+
     // Выполнить следующий шаг
     async function executeNextStep() {
         // Проверяем дневной лимит перед каждым шагом
         if (checkDailyLimitAndStop()) return;
+        // Капча до начала шага: стоп, либо (по настройке) закрываем и продолжаем
+        if (isCaptchaDetected()) {
+            if (!CONFIG.ignoreCaptcha) {
+                handleCaptchaStop();
+                return;
+            }
+            log('Капча на странице — игнорирую (настройка), пробую закрыть', 'warn');
+            await dismissCaptcha();
+            if (/\/captcha/i.test(window.location.href)) return; // ушли на поиск
+        }
         saveState(); // Сохраняем состояние в начале каждого шага
 
             if (STATE.currentVacancyIndex >= STATE.vacancies.length) {
@@ -1678,6 +1885,169 @@ Email: pantin_42@inbox.ru`,
         }
     }
 
+    // Слова-маркеры живого интереса: приглашение, просьба позвонить/написать, вопрос.
+    // Такие чаты НИКОГДА не открываем — пусть остаются непрочитанными для пользователя.
+    // Приоритет выше, чем у отказов: «Спасибо за отклик! Приглашаем на интервью» — это приглашение.
+    const CHAT_INVITE_KEYWORDS = [
+        // приглашение / встреча
+        'приглаша', 'приглашени', 'собеседовани', 'интервью', 'встреч', 'следующий этап', 'следующему этапу',
+        'созвон', 'созвонить', 'позвон', 'звонок', 'перезвон', 'видеозвон', 'zoom', 'зум', 'телемост',
+        // просьба связаться / написать
+        'свяжитесь', 'напишите', 'ответьте', 'пришлите', 'отправьте', 'оставьте', 'укажите', 'сообщите',
+        'telegram', 'телеграм', 'whatsapp', 'ватсап', 'вотсап', 'номер телефона', 'ваш номер', 'ваш телефон',
+        // вопросы / дальнейшие шаги
+        'удобно', 'удобное время', 'когда вам', 'актуальн', 'расскажите', 'уточнить', 'уточните',
+        'готовы ли', 'интересно ли', 'интересна ли', 'зарплатные ожидания', 'ожидания по',
+        'тестовое', 'тестового', 'анкет', 'заполните', 'пройдите', 'опрос', 'forms.gle', 'google.com/forms', 'forms.yandex',
+        'заинтересовало ваше', 'заинтересовал ваш', 'нас заинтересова', 'хотели бы обсудить', 'давайте обсудим',
+        'хотим предложить', 'хотели бы предложить', 'готовы предложить вам', 'оффер',
+    ];
+
+    // Однозначный отказ (с отрицанием) — проверяется РАНЬШЕ приглашений:
+    // «не готовы пригласить вас на следующий этап» содержит и «приглас», и «следующий этап»
+    const CHAT_HARD_REJECT_KEYWORDS = [
+        'вынуждены отказать', 'не готовы пригласить', 'не можем пригласить', 'не сможем пригласить',
+        'не готовы продолжить', 'не сможем предложить', 'не готовы предложить вам', 'не готовы рассмотреть',
+        'не соответствует', 'кандидатура не', 'сделали выбор в пользу', 'отдали предпочтение',
+        'остановились на другом', 'выбрали другого', 'закрыли эту позицию', 'закрыли вакансию', 'вакансия закрыта',
+        'приостановили поиск', 'поиск приостановлен', 'поставлена на паузу', 'неактуальн', 'не актуальн',
+        'потеряла актуальность',
+        // Автоответы с условным «напишет/позвонит» — иначе их поймали бы слова-приглашения
+        'ответы отправлены', 'ответы на вопросы отправлены', 'если ваш отклик его заинтересует',
+        'если ваш отклик заинтересует', 'если отклик заинтересует', 'если ваше резюме заинтересует',
+        'если ваша кандидатура заинтересует', 'он напишет в этом же чате',
+    ];
+
+    // Отказы и автоотписки «приняли, ждите» — такие чаты открываем (помечаем прочитанными)
+    const CHAT_REJECT_KEYWORDS = [
+        // --- Прямые отказы ---
+        'отказ', 'к сожалению', 'не подходит',
+        'желаем удачи', 'успехов в поиске', 'дальнейших профессиональных успехов', 'удачи в поиске',
+        // --- Кадровый резерв ---
+        'сохраним ваше резюме', 'в кадровый резерв', 'в нашей базе', 'будем иметь вас в виду',
+        'вернемся к вам, если', 'если появится подходящая',
+        // --- Автоотписки «приняли, ждите» ---
+        'спасибо за отклик', 'благодарим за отклик', 'благодарим вас за отклик', 'спасибо за ваш отклик',
+        'спасибо за проявленный интерес', 'благодарим за интерес', 'спасибо за интерес',
+        'успешно зарегистрирован', 'отклик получен', 'получили ваш отклик', 'получили ваше резюме',
+        'отклик зарегистрирован', 'направлен в', 'передали ваше резюме', 'передано руководителю',
+        'передали руководителю', 'внимательно ознакомились', 'ознакомимся', 'рассмотрим ваше резюме',
+        'рассмотрим вашу кандидатуру', 'рассмотрим ваш отклик', 'в ближайшее время', 'свяжемся с вами',
+        'обязательно свяжемся', 'если ваша кандидатура', 'если ваше резюме', 'если оно заинтересует',
+        'если навыки', 'если ваш опыт', 'если опыт', 'подойдут для позиции', 'подойдет для позиции',
+        'в случае заинтересованности', 'в случае положительного',
+    ];
+
+    function normChatText(value) {
+        return (value || '').replace(/ /g, ' ').replace(/ё/gi, 'е').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    /**
+     * 'invite' — приглашение/вопрос/просьба связаться (не трогаем),
+     * 'reject' — отказ или автоотписка (открываем),
+     * 'unknown' — непонятно (не трогаем, безопасный вариант).
+     */
+    function classifyChatMessage(text) {
+        const t = normChatText(text);
+        if (!t) return 'unknown';
+        if (CHAT_HARD_REJECT_KEYWORDS.some(k => t.includes(k))) return 'reject';
+        if (CHAT_INVITE_KEYWORDS.some(k => t.includes(k))) return 'invite';
+        // Вопрос от работодателя («Вы ответили на опросник…?») — ждёт ответа, не трогаем
+        if (t.includes('?')) return 'invite';
+        if (CHAT_REJECT_KEYWORDS.some(k => t.includes(k))) return 'reject';
+        // Вопрос работодателя без явных маркеров — скорее живой человек, не трогаем
+        return 'unknown';
+    }
+
+    /**
+     * Классификация карточки чата целиком:
+     *  - 'own'    — последнее сообщение наше (у него галочки «доставлено/прочитано»),
+     *  - системный статус hh по цвету: красный «Отказ» → 'reject', зелёный «Собеседование»/«Отклик» → 'invite',
+     *  - иначе — по тексту сообщения работодателя.
+     */
+    function classifyChatCell(cell, message) {
+        if (qs('[data-qa^="status-icon-"]', cell)) return 'own';
+        const msgEl = qs(SELECTORS.chatLastMessage, cell);
+        const cls = msgEl ? String(msgEl.className) : '';
+        if (cls.includes('last-message-color_red')) return 'reject';
+        if (cls.includes('last-message-color_green')) return 'invite';
+        return classifyChatMessage(message);
+    }
+
+    function getChatId(cell) {
+        const m = (cell.getAttribute('data-qa') || '').match(/chatik-open-chat-(\d+)/) || (cell.getAttribute('href') || '').match(/\/chat\/(\d+)/);
+        return m ? m[1] : null;
+    }
+
+    // Только текст последнего сообщения — без названия вакансии и компании
+    function getChatLastMessage(cell) {
+        const el = qs(SELECTORS.chatLastMessage, cell);
+        if (el) return el.textContent || '';
+        let text = cell.textContent || '';
+        [SELECTORS.chatCellTitle, SELECTORS.chatCellSubtitle].forEach(sel => {
+            const part = qs(sel, cell);
+            if (part) text = text.replace(part.textContent, ' ');
+        });
+        return text;
+    }
+
+    // Включает фильтр «Только непрочитанные»
+    async function ensureOnlyUnreadFilter() {
+        const cb = qs(SELECTORS.chatOnlyUnreadCheckbox);
+        if (cb) {
+            if (!cb.checked) {
+                log('Включаю фильтр "Только непрочитанные"...', 'info');
+                (cb.closest('label') || cb).click();
+                await wait(DELAYS.animation); // ждём перезагрузку списка
+            }
+            return;
+        }
+        // Запасной вариант, если data-qa поменяется
+        const label = qsa('label').find(l => normChatText(l.textContent).includes('только непрочитанные'));
+        const fallbackCb = label && qsa('input[type="checkbox"]', label).pop();
+        if (fallbackCb && !fallbackCb.checked) {
+            log('Включаю фильтр "Только непрочитанные"...', 'info');
+            label.click();
+            await wait(DELAYS.animation);
+        }
+    }
+
+    // Ближайший прокручиваемый предок списка чатов
+    function getChatScrollContainer() {
+        let el = qs(SELECTORS.chatCell);
+        while (el && el !== document.body) {
+            const style = getComputedStyle(el);
+            if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight) return el;
+            el = el.parentElement;
+        }
+        return null;
+    }
+
+    // Ищет среди отрисованных строк непрочитанный чат с отказом/автоотпиской
+    function findRejectChatOnScreen() {
+        for (const cell of qsa(SELECTORS.chatCell)) {
+            const id = getChatId(cell);
+            if (!id || REJECT_STATE.processedIds.has(id) || REJECT_STATE.keptIds.has(id)) continue;
+            if (!qs(SELECTORS.chatUnreadBadge, cell)) continue; // прочитан — пропускаем
+
+            const message = getChatLastMessage(cell);
+            const kind = classifyChatCell(cell, message);
+            const company = normText((qs(SELECTORS.chatCellSubtitle, cell) || {}).textContent) || '?';
+            const preview = normText(message).slice(0, 80);
+
+            if (kind === 'reject') return { cell, id, company, preview };
+
+            REJECT_STATE.keptIds.add(id);
+            if (kind === 'own') continue; // последнее сообщение наше — молча пропускаем
+            if (kind === 'invite') {
+                log(`📩 ${company}: похоже на приглашение/вопрос — НЕ трогаю: «${preview}…»`, 'success');
+            } else {
+                log(`❔ ${company}: непонятное сообщение — оставляю непрочитанным: «${preview}…»`, 'warn');
+            }
+        }
+        return null;
+    }
+
     async function executeRejectNext() {
         if (!location.pathname.includes('/chat') && !location.pathname.includes('/applicant/negotiations')) {
             log('Для работы с отказами перейдите на страницу чатов (/chat или /applicant/negotiations)', 'error');
@@ -1687,123 +2057,40 @@ Email: pantin_42@inbox.ru`,
 
         // Дадим странице немного времени на полную прорисовку
         await wait(DELAYS.small);
+        await ensureOnlyUnreadFilter();
 
-        // 1. Проверяем и включаем галочку "Только непрочитанные", если она выключена
-        const unreadLabel = qsa('label').find(l => (l.textContent || '').toLowerCase().includes('непрочитан'));
-        if (unreadLabel) {
-            const cb = unreadLabel.querySelector('input[type="checkbox"]');
-            if (cb && !cb.checked) {
-                log('Включаю галочку "Только непрочитанные"...', 'info');
-                cb.click();
-                await wait(DELAYS.animation); // Ждем подгрузки списка
-            }
-        } else {
-            const unreadBtn = qsa('button, [role="checkbox"]').find(b => (b.textContent || '').toLowerCase().includes('непрочитан'));
-            if (unreadBtn && unreadBtn.getAttribute('aria-checked') === 'false') {
-                log('Включаю фильтр "Только непрочитанные"...', 'info');
-                unreadBtn.click();
-                await wait(DELAYS.animation);
-            }
+        log('Ищу непрочитанные отказы и автоотписки...', 'info');
+
+        // Список виртуальный: если на экране нечего обрабатывать — прокручиваем дальше
+        let target = findRejectChatOnScreen();
+        const scroller = target ? null : getChatScrollContainer();
+        for (let i = 0; !target && scroller && i < 20; i++) {
+            const before = scroller.scrollTop;
+            scroller.scrollTop += Math.max(200, scroller.clientHeight * 0.8);
+            await wait(DELAYS.wait); // подгрузка строк
+            target = findRejectChatOnScreen();
+            if (!target && scroller.scrollTop === before) break; // дошли до конца
         }
 
-        log('Ищу непрочитанные сообщения с отказами или "свяжемся с вами"...', 'info');
-        
-        // Получаем все элементы, которые могут быть карточкой чата в списке
-        const chatItems = qsa('[data-qa*="item"], a[href*="/chat/"]');
-        let targetEl = null;
-
-        for (const el of chatItems) {
-            // Пропускаем крупные списки-контейнеры
-            if (el.tagName === 'UL' || el.tagName === 'OL') continue;
-
-            // Если этот элемент внутри уже обработанного (или наоборот содержит его), пропускаем
-            let alreadyProcessed = false;
-            for (const processedNode of REJECT_STATE.processedNodes) {
-                if (processedNode.contains(el) || el.contains(processedNode)) {
-                    alreadyProcessed = true;
-                    break;
-                }
-            }
-            if (alreadyProcessed) continue;
-
-            // 3. Проверка на наличие счетчика непрочитанных сообщений
-            const badge = qs(SELECTORS.chatUnreadBadge, el);
-            if (!badge) continue; // Нет бейджа — сообщение уже прочитано, пропускаем
-
-            // 2. Проверяем наличие ключевых слов для отказа (в нижнем регистре)
-            const text = (el.textContent || '').toLowerCase();
-            const keywords = [
-                // --- Текущие базовые ---
-                'отказ',
-                'свяжемся с вами',
-                'рассмотрим ваше резюме',
-                'к сожалению',
-                'закрыли эту позицию',
-
-                // --- Прямые отказы ---
-                'вынуждены отказать',
-                'не готовы пригласить',
-                'не готовы продолжить',
-                'не сможем предложить',
-                'не готовы предложить',
-                'сделали выбор в пользу другого',
-                'отдали предпочтение',
-                'остановились на другом',
-                'вакансия закрыта',
-                'приостановили поиск',
-                'поиск приостановлен',
-                'поставлена на паузу',
-                'желаем удачи в поисках',
-                'успехов в поиске',
-                'дальнейших профессиональных успехов',
-
-                // --- Кадровый резерв (фактический отказ по текущей заявке) ---
-                'сохраним ваше резюме',
-                'в кадровый резерв',
-                'будем иметь вас в виду',
-                'вернемся к вам, если',
-                'если появится подходящая',
-
-                // --- Автоответы-заглушки ---
-                'внимательно ознакомились',
-                'передали ваше резюме',
-                'передано руководителю',
-                'передали руководителю',
-                'спасибо за отклик',
-                'спасибо за проявленный интерес',
-                'благодарим за интерес'
-            ];
-            if (keywords.some(keyword => text.includes(keyword))) {
-                targetEl = el;
-                REJECT_STATE.processedNodes.add(el);
-                break;
-            }
-        }
-
-        if (!targetEl) {
-            log('Новых сообщений с отказами не найдено на экране. Попробуйте прокрутить список ниже.', 'warn');
+        if (!target) {
+            log('Непрочитанных отказов/автоотписок больше нет.', 'success');
             if (REJECT_STATE.isRunning) toggleAutoRejectMode();
             return;
         }
 
-        log('Найдено сообщение с отказом, кликаю...', 'step');
-        
-        // Скроллим к элементу, чтобы он был в зоне видимости
-        targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await wait(300);
-        
-        // Находим кликабельный узел (ссылку или кнопку внутри карточки, либо саму карточку)
-        const clickable = targetEl.tagName === 'A' || targetEl.tagName === 'BUTTON' ? targetEl : (qs('a, button', targetEl) || targetEl);
-        
+        REJECT_STATE.processedIds.add(target.id);
+        log(`Отказ/автоотписка от ${target.company}: «${target.preview}…» — открываю`, 'step');
+
+        target.cell.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await wait(DELAYS.click);
         try {
-            clickable.click();
+            target.cell.click();
         } catch (e) {
             log('Не удалось кликнуть по сообщению: ' + e.message, 'error');
         }
 
-        log('Жду 2 секунды...', 'info');
         await wait(DELAYS.step);
-        
+
         if (REJECT_STATE.isRunning) {
             autoRejectInterval = setTimeout(() => {
                 if (REJECT_STATE.isRunning) executeRejectNext();
@@ -1950,6 +2237,12 @@ Email: pantin_42@inbox.ru`,
 
         document.getElementById('hh-btn-next').disabled = false;
 
+        // Не в авто-режиме страницу не трогаем: на ней может работать респондер или сам пользователь
+        if (!STATE.isRunning) {
+            setStepDesc(`Страница отклика: "${vacancy.title}". Нажмите Next для обработки.`);
+            return;
+        }
+
         // Сценарий 3: вопросы работодателя — автоматически в аутлайн
         if (isOutlineDetected()) {
             await handleOutlineOutcome(vacancy);
@@ -1957,18 +2250,13 @@ Email: pantin_42@inbox.ru`,
         }
 
         // В авто-режиме обрабатываем сразу (письмо → "Отправить")
-        if (STATE.isRunning) {
-            const outcome = await waitForApplyOutcome(vacancy, 5000);
-            const status = await runUnifiedApply(vacancy, outcome === 'none' ? 'response' : outcome);
-            if (status !== 'disabled' && status !== 'stopped') {
-                STATE.returnedFromOutline = true;
-                saveState();
-                redirectSearch();
-            }
-            return;
+        const outcome = await waitForApplyOutcome(vacancy, 5000);
+        const status = await runUnifiedApply(vacancy, outcome === 'none' ? 'response' : outcome);
+        if (status !== 'disabled' && status !== 'stopped') {
+            STATE.returnedFromOutline = true;
+            saveState();
+            redirectSearch();
         }
-
-        setStepDesc(`Страница отклика: "${vacancy.title}". Нажмите Next для обработки.`);
     }
 
     // Запуск

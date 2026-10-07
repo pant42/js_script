@@ -19,22 +19,40 @@ Email: pantin_42@inbox.ru`,
         autoModeDelay: 3000, // Задержка в мс для авто-режима
         fieldFillDelay: 300, // Задержка перед заполнением каждого поля
         submitDelay: 3000, // Задержка в мс перед отправкой отклика
+        // Не останавливаться при капче: закрыть её, пропустить вакансию и продолжить (на свой риск)
+        ignoreCaptcha: !!(GM_getValue('hh_autoresponder_config', {}) || {}).ignoreCaptcha,
     };
+
+    const CAPTCHA_IGNORE_WARNING =
+        'ВНИМАНИЕ!\n\n' +
+        'Работа без остановки с игнорированием капчи возможна, но за корректную работу скрипта, ' +
+        'сохранность аккаунта и корректную обработку откликов никто не отвечает.\n\n' +
+        'При капче скрипт закроет её окно, пропустит вакансию (отклик, скорее всего, не отправится) и продолжит.\n\n' +
+        'Включить?';
+
+    function saveConfig() {
+        GM_setValue('hh_autoresponder_config', { ignoreCaptcha: CONFIG.ignoreCaptcha });
+    }
 
     const STATE = {
         vacancies: [],
         currentVacancyIndex: 0,
         isAutoMode: false,
+        // Пользователь нажал Next: обработать ОДНУ вакансию после перехода на её страницу
+        pendingManualStep: false,
         persistentLogs: [], // Для отладки между перезагрузками
     };
 
     let autoResponseInterval = null;
+    // Поднимается кнопкой "Стоп" — прерывает текущую обработку страницы
+    let stopRequested = false;
 
     function saveState() {
         GM_setValue('hh_autoresponder_state', {
             vacancies: STATE.vacancies,
             currentVacancyIndex: STATE.currentVacancyIndex,
             isAutoMode: STATE.isAutoMode,
+            pendingManualStep: STATE.pendingManualStep,
             persistentLogs: STATE.persistentLogs,
         });
     }
@@ -44,6 +62,8 @@ Email: pantin_42@inbox.ru`,
         if (savedState) {
             STATE.vacancies = savedState.vacancies || [];
             STATE.currentVacancyIndex = savedState.currentVacancyIndex || 0;
+            STATE.isAutoMode = !!savedState.isAutoMode;
+            STATE.pendingManualStep = !!savedState.pendingManualStep;
             STATE.persistentLogs = savedState.persistentLogs || [];
         }
     }
@@ -58,6 +78,7 @@ Email: pantin_42@inbox.ru`,
         coverLetterInput: '[data-qa="vacancy-response-popup-form-letter-input"]',
         submitButton: '[data-qa="vacancy-response-submit-popup"]',
         alreadyRespondedText: '[data-qa="already-responded-text"]',
+        captcha: '[data-qa="account-captcha-picture"], [data-qa="account-captcha-input"], [data-qa="account-captcha-error"], img[src*="/captcha/picture"]',
     };
 
     // ============================================================
@@ -108,6 +129,83 @@ Email: pantin_42@inbox.ru`,
         return !!qs(SELECTORS.alreadyRespondedText);
     }
 
+    // Элемент реально отображается (закрытые модалки остаются в DOM)
+    function isVisible(el) {
+        return !!el && document.documentElement.contains(el) && el.getClientRects().length > 0;
+    }
+
+    const CAPTCHA_TEXT_RE = /пройдите капчу|подтвердите, что вы не робот|подтвердить, что вы не робот/i;
+
+    // Капча: модал «Пройдите капчу» или полностраничный редирект на /captcha
+    function isCaptchaDetected() {
+        if (qsa(SELECTORS.captcha).some(isVisible)) return true;
+        if (/\/captcha/i.test(window.location.href)) return true;
+        return CAPTCHA_TEXT_RE.test((document.body.innerText || '').replace(/\s+/g, ' '));
+    }
+
+    // Закрыть окно капчи: крестик в шапке модалки, затем Escape
+    async function dismissCaptcha() {
+        const dialog = qsa('[role="dialog"]').filter(isVisible).find(d =>
+            qs(SELECTORS.captcha, d) || CAPTCHA_TEXT_RE.test(d.textContent.replace(/\s+/g, ' '))
+        );
+        if (!dialog) return false;
+        const closeBtn = qs('[data-qa="modal-header"] button', dialog);
+        if (closeBtn) {
+            closeBtn.click();
+            await wait(500);
+        }
+        if (isVisible(dialog)) {
+            const opts = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+            dialog.dispatchEvent(new KeyboardEvent('keydown', opts));
+            document.dispatchEvent(new KeyboardEvent('keydown', opts));
+            await wait(500);
+        }
+        return !isVisible(dialog);
+    }
+
+    /**
+     * Капча обнаружена: по настройке либо останавливаемся (вакансия остаётся текущей,
+     * после прохождения капчи можно нажать Next), либо закрываем капчу и идём дальше.
+     */
+    async function handleCaptcha(vacancyData) {
+        const title = (vacancyData && vacancyData.vacancyTitle) || 'вакансия';
+        if (CONFIG.ignoreCaptcha) {
+            log(`Капча на "${title}". Игнорирую (настройка), пропускаю вакансию.`, 'warn');
+            const closed = await dismissCaptcha();
+            if (!closed) log('Окно капчи закрыть не удалось — продолжаю', 'warn');
+            moveToNextVacancy();
+            return;
+        }
+        console.error('[HH-Responder] Капча! Пройдите капчу вручную, затем нажмите Next или Автоответ. ' +
+            '(Можно включить "Не останавливаться при капче" в панели — на свой риск.)');
+        log(`Капча на "${title}". Скрипт остановлен — пройдите капчу и нажмите Next/Автоответ.`, 'error');
+        haltScript();
+        setStepDesc(`КАПЧА на "${title}". Пройдите её вручную, затем Next или Автоответ.`);
+    }
+
+    // Прерывание по "Стоп" или по капче. true — дальше не работаем.
+    async function checkInterrupt(vacancyData) {
+        if (stopRequested) {
+            log('Обработка прервана кнопкой "Стоп".', 'warn');
+            return true;
+        }
+        if (isCaptchaDetected()) {
+            await handleCaptcha(vacancyData);
+            return true;
+        }
+        return false;
+    }
+
+    // Ожидание, которое можно прервать кнопкой "Стоп"
+    async function interruptibleWait(ms) {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+            if (stopRequested) return false;
+            await wait(Math.min(200, end - Date.now()));
+        }
+        return !stopRequested;
+    }
+
     // ============================================================
     //  ЛОГИКА ОТВЕТОВ
     // ============================================================
@@ -119,7 +217,7 @@ Email: pantin_42@inbox.ru`,
         if (STATE.currentVacancyIndex >= STATE.vacancies.length) {
             log('Все вакансии из файла обработаны.', 'success');
             setStepDesc('Все вакансии обработаны.');
-            if (STATE.isAutoMode) toggleAutoMode(); // Останавливаем авто-режим
+            haltScript(); // Останавливаем авто-режим
             return;
         }
 
@@ -146,6 +244,8 @@ Email: pantin_42@inbox.ru`,
         log(`На странице "${vacancyData.vacancyTitle}". Начинаю обработку вопросов.`, 'info');
         setStepDesc(`Отвечаю на вопросы для "${vacancyData.vacancyTitle}"`);
 
+        if (await checkInterrupt(vacancyData)) return;
+
         // ПРОВЕРКА: если уже откликнулись, пропускаем
         if (isAlreadyRespondedOnPage()) {
             log('Обнаружен маркер "Вы откликнулись". Пропускаю вакансию.', 'warn');
@@ -166,6 +266,7 @@ Email: pantin_42@inbox.ru`,
         for (const block of questionBlocks) {
             // Добавляем задержку перед обработкой каждого вопроса
             await wait(CONFIG.fieldFillDelay);
+            if (await checkInterrupt(vacancyData)) return;
 
             const pageQuestionTextEl = qs(SELECTORS.taskQuestion, block);
             if (!pageQuestionTextEl) continue;
@@ -215,7 +316,8 @@ Email: pantin_42@inbox.ru`,
                     });
 
                     if (target) {
-                        target.click();
+                        // Повторный клик по уже отмеченному чекбоксу снял бы отметку
+                        if (!target.checked) target.click();
                         log(`   -> Выбран ответ: "${text}"`, 'success');
                         return target.closest('label');
                     }
@@ -281,6 +383,7 @@ Email: pantin_42@inbox.ru`,
         log('Прикладываю сопроводительное письмо...', 'step');
         // Добавляем задержку перед заполнением сопроводительного письма
         await wait(CONFIG.fieldFillDelay);
+        if (await checkInterrupt(vacancyData)) return;
 
         const toggle = qs(SELECTORS.coverLetterToggle);
         if (toggle) {
@@ -322,13 +425,22 @@ Email: pantin_42@inbox.ru`,
         // --- НОВОЕ: Автоматическая отправка ---
         const submitButton = qs(SELECTORS.submitButton);
         if (submitButton && !submitButton.disabled) {
-            log(`Все поля заполнены. Ожидаю ${CONFIG.submitDelay / 1000} сек. перед отправкой...`, 'success');
+            log(`Все поля заполнены. Ожидаю ${CONFIG.submitDelay / 1000} сек. перед отправкой (можно нажать "Стоп")...`, 'success');
             setStepDesc(`Все поля для "${vacancyData.vacancyTitle}" заполнены. Отправка через ${CONFIG.submitDelay / 1000} сек...`);
-            await wait(CONFIG.submitDelay);
+            await interruptibleWait(CONFIG.submitDelay);
+            if (await checkInterrupt(vacancyData)) return;
 
             log('Нажимаю "Откликнуться"...', 'step');
             submitButton.click();
-            await wait(1000); // Небольшая пауза после клика
+
+            // После клика может выскочить капча — тогда отклик не отправлен
+            for (let i = 0; i < 10; i++) {
+                await wait(300);
+                if (isCaptchaDetected()) {
+                    await handleCaptcha(vacancyData);
+                    return;
+                }
+            }
             persistentLog(`handleResponsePage: Отклик на вакансию #${STATE.currentVacancyIndex} отправлен. Вызываю moveToNextVacancy.`);
             log('Отклик отправлен. Перехожу к следующей вакансии.', 'success');
             moveToNextVacancy();
@@ -344,15 +456,31 @@ Email: pantin_42@inbox.ru`,
      */
     function moveToNextVacancy() {
         STATE.currentVacancyIndex++;
+        STATE.pendingManualStep = false;
         saveState();
         updateStats();
-        if (STATE.isAutoMode) {
+        if (STATE.isAutoMode && !stopRequested) {
             if (autoResponseInterval) clearTimeout(autoResponseInterval);
             autoResponseInterval = setTimeout(processNextVacancy, CONFIG.autoModeDelay);
+        } else if (STATE.currentVacancyIndex < STATE.vacancies.length) {
+            // Ручной режим: один Next = одна вакансия, дальше ждём пользователя
+            const next = STATE.vacancies[STATE.currentVacancyIndex];
+            setStepDesc(`Готово. Следующая: "${next.vacancyTitle}". Нажмите Next.`);
         } else {
-            // В ручном режиме просто вызываем следующий шаг, чтобы он перешел на URL
-            processNextVacancy();
+            log('Все вакансии из файла обработаны.', 'success');
+            setStepDesc('Все вакансии обработаны.');
         }
+    }
+
+    /**
+     * Кнопка Next: обработать ровно одну текущую вакансию (перейти на неё, ответить, отправить).
+     */
+    function manualNext() {
+        if (STATE.isAutoMode) return; // в авто-режиме Next не нужен
+        stopRequested = false;
+        STATE.pendingManualStep = true;
+        saveState();
+        processNextVacancy();
     }
 
     // ============================================================
@@ -379,6 +507,8 @@ Email: pantin_42@inbox.ru`,
         }
         .log-info { color: #58a6ff; } .log-success { color: #3fb950; }
         .log-warn { color: #d29922; } .log-error { color: #f85149; } .log-step { color: #bc8cff; }
+        .resp-check { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 12px; color: #ccc; cursor: pointer; }
+        .resp-check-note { font-size: 11px; color: #f85149; margin-top: 2px; }
     `;
 
     function panelHTML() {
@@ -392,6 +522,13 @@ Email: pantin_42@inbox.ru`,
                     <button id="resp-btn-next" class="resp-btn resp-btn-primary" disabled>Next</button>
                     <button id="resp-btn-auto" class="resp-btn resp-btn-secondary" disabled>Автоответ</button>
                     <button id="resp-btn-stop" class="resp-btn" style="background: #f44336; color: white;" disabled>Стоп</button>
+                </div>
+                <label class="resp-check">
+                    <input type="checkbox" id="resp-input-ignore-captcha" ${CONFIG.ignoreCaptcha ? 'checked' : ''} />
+                    Не останавливаться при капче
+                </label>
+                <div class="resp-check-note" id="resp-ignore-captcha-note" style="display:${CONFIG.ignoreCaptcha ? 'block' : 'none'};">
+                    ⚠ Капча игнорируется — работа на свой риск
                 </div>
                 <div id="hh-responder-log"></div>
             </div>
@@ -407,9 +544,21 @@ Email: pantin_42@inbox.ru`,
         document.body.appendChild(panel);
 
         document.getElementById('resp-file-input').addEventListener('change', handleFileSelect);
-        document.getElementById('resp-btn-next').onclick = processNextVacancy;
+        document.getElementById('resp-btn-next').onclick = manualNext;
         document.getElementById('resp-btn-auto').onclick = toggleAutoMode;
         document.getElementById('resp-btn-stop').onclick = stopScript;
+        document.getElementById('resp-input-ignore-captcha').addEventListener('change', (e) => {
+            if (e.target.checked && !window.confirm(CAPTCHA_IGNORE_WARNING)) {
+                e.target.checked = false;
+                return;
+            }
+            CONFIG.ignoreCaptcha = e.target.checked;
+            saveConfig();
+            document.getElementById('resp-ignore-captcha-note').style.display = CONFIG.ignoreCaptcha ? 'block' : 'none';
+            log(CONFIG.ignoreCaptcha
+                ? 'Капча игнорируется: скрипт не будет останавливаться (на свой риск)'
+                : 'При капче скрипт будет останавливаться', CONFIG.ignoreCaptcha ? 'warn' : 'success');
+        });
 
         initDragDrop(panel, 'hh-responder-header', 'hh_responder_panel_pos');
     }
@@ -487,35 +636,45 @@ Email: pantin_42@inbox.ru`,
      * Полностью останавливает скрипт.
      */
     function stopScript() {
-        log('Скрипт полностью остановлен пользователем.', 'error');
-        setStepDesc('Остановлено. Нажмите "Автоответ" для возобновления.');
+        log('Скрипт остановлен пользователем. Можно отвечать вручную.', 'error');
+        haltScript();
+        setStepDesc('Остановлено. Нажмите Next (одна вакансия) или "Автоответ".');
+    }
+
+    // Остановка без сообщений: гасит авто-режим, таймеры и текущую обработку (переживает перезагрузку)
+    function haltScript() {
+        stopRequested = true;
         if (autoResponseInterval) {
             clearTimeout(autoResponseInterval);
             autoResponseInterval = null;
         }
-        if (STATE.isAutoMode) {
-            STATE.isAutoMode = false;
-            const btn = document.getElementById('resp-btn-auto');
-            btn.textContent = 'Автоответ';
-            btn.style.background = '';
-        }
+        STATE.isAutoMode = false;
+        STATE.pendingManualStep = false;
         saveState();
+        updateAutoButton();
+    }
+
+    function updateAutoButton() {
+        const btn = document.getElementById('resp-btn-auto');
+        if (!btn) return;
+        btn.textContent = STATE.isAutoMode ? 'Пауза' : 'Автоответ';
+        btn.style.background = STATE.isAutoMode ? '#FF9800' : '';
     }
 
     function toggleAutoMode() {
-        STATE.isAutoMode = !STATE.isAutoMode;
-        const btn = document.getElementById('resp-btn-auto');
         if (STATE.isAutoMode) {
-            btn.textContent = 'Стоп';
-            btn.style.background = '#FF9800';
-            log('Авто-режим запущен.', 'warn');
-            processNextVacancy();
-        } else {
-            btn.textContent = 'Автоответ';
-            btn.style.background = '';
-            if (autoResponseInterval) clearTimeout(autoResponseInterval);
             log('Авто-режим остановлен.', 'warn');
+            haltScript();
+            setStepDesc('Авто-режим остановлен.');
+            return;
         }
+        stopRequested = false;
+        STATE.isAutoMode = true;
+        STATE.pendingManualStep = false;
+        saveState();
+        updateAutoButton();
+        log('Авто-режим запущен.', 'warn');
+        processNextVacancy();
     }
 
     /**
@@ -534,10 +693,11 @@ Email: pantin_42@inbox.ru`,
                 // ИЗМЕНЕНО: фильтруем по v.answers
                 STATE.vacancies = data.filter(v => v.answers && v.answers.some(q => q.answer));
                 STATE.currentVacancyIndex = 0;
-                saveState(); // Сохраняем состояние после загрузки файла
+                // Загрузка файла НИЧЕГО не запускает: старт только по Next или "Автоответ"
+                haltScript();
                 if (STATE.vacancies.length > 0) {
                     log(`Загружено ${STATE.vacancies.length} вакансий с ответами.`, 'success');
-                    setStepDesc('Файл загружен. Готов к работе.');
+                    setStepDesc('Файл загружен. Нажмите Next (одна вакансия) или "Автоответ".');
                     document.getElementById('resp-btn-next').disabled = false;
                     document.getElementById('resp-btn-auto').disabled = false;
                     document.getElementById('resp-btn-stop').disabled = false;
@@ -569,6 +729,7 @@ Email: pantin_42@inbox.ru`,
         createUI();
         await loadState();
         updateStats();
+        updateAutoButton();
 
         // Выводим историю логов для отладки
         if (STATE.persistentLogs.length > 0) {
@@ -586,25 +747,36 @@ Email: pantin_42@inbox.ru`,
             document.getElementById('resp-btn-auto').disabled = false;
             document.getElementById('resp-btn-stop').disabled = false;
 
-            // Проверяем, не на нужной ли мы уже странице
+            // Сам по себе скрипт ничего не запускает: работаем только в авто-режиме
+            // или если пользователь нажал Next (pendingManualStep)
             const vacancy = STATE.vacancies[STATE.currentVacancyIndex];
-            if (window.location.href.split('#')[0] === vacancy.vacancyUrl.split('#')[0]) {
+            const onVacancyPage = window.location.href.split('#')[0] === vacancy.vacancyUrl.split('#')[0];
+            const shouldWork = STATE.isAutoMode || STATE.pendingManualStep;
+
+            if (!shouldWork) {
+                persistentLog('init: скрипт на паузе, ничего не делаю.');
+                if (onVacancyPage) setStepDesc(`Пауза. Вы на странице "${vacancy.vacancyTitle}" — отвечайте вручную или нажмите Next.`);
+                return;
+            }
+
+            if (isCaptchaDetected()) {
+                await handleCaptcha(vacancy);
+                return;
+            }
+
+            if (onVacancyPage) {
                 persistentLog(`init: URL совпал, вызываю handleResponsePage для вакансии #${STATE.currentVacancyIndex}`);
                 await handleResponsePage(vacancy);
-        } else {
-            persistentLog(`init: URL НЕ совпал. Текущий: ${window.location.href}, ожидаемый: ${vacancy.vacancyUrl}.`);
-            // Если включен авто-режим, но мы не на той странице, нужно инициировать переход
-            if (STATE.isAutoMode) {
+            } else if (STATE.isAutoMode) {
+                persistentLog(`init: URL НЕ совпал. Текущий: ${window.location.href}, ожидаемый: ${vacancy.vacancyUrl}.`);
                 log('Авто-режим включен, но мы не на нужной странице. Инициирую переход...', 'warn');
                 processNextVacancy();
             } else {
-                // --- ИСПРАВЛЕНИЕ: Автоматически продолжаем работу, если есть необработанные вакансии ---
-                log('Обнаружены необработанные вакансии и несоответствие URL. Запускаю авто-режим для продолжения...', 'info');
-                // Не используем toggleAutoMode, чтобы избежать двойного переключения. Просто запускаем процесс.
-                STATE.isAutoMode = true;
-                processNextVacancy();
+                // Next нажат, но страница вакансии не открылась (редирект и т.п.) — не зацикливаемся
+                STATE.pendingManualStep = false;
+                saveState();
+                setStepDesc(`Не удалось открыть страницу вакансии. Нажмите Next ещё раз.`);
             }
-        }
         }
     }
 
